@@ -60,12 +60,55 @@ function Adb([string[]] $args_) { & adb -s $Serial @args_ 2>&1 }
 function Sh([string]  $cmd)     { & adb -s $Serial shell su -c $cmd 2>&1 }
 
 Step 0 "Checking adb + root"
-$dev = (& adb devices) -join "`n"
-if ($dev -notmatch [regex]::Escape($Serial)) {
-    Warn "$Serial not connected, trying adb connect"
-    & adb connect $Serial | Out-Host
-    Start-Sleep -Seconds 2
+
+# "device offline" is a stale adb transport, not a broken app. It happens every
+# time BlueStacks pauses or restarts its adbd, so walk the recovery ladder rather
+# than failing on the first attempt.
+function Get-AdbState([string] $serial) {
+    $out = (& adb -s $serial get-state 2>&1) -join " "
+    if ($out -match "device")       { return "device" }
+    if ($out -match "offline")      { return "offline" }
+    if ($out -match "unauthorized") { return "unauthorized" }
+    return "absent"
 }
+
+function Wait-AdbDevice([string] $serial, [int] $timeoutSec = 45) {
+    if ((Get-AdbState $serial) -eq "device") { return $true }
+
+    $steps = @(
+        @{ Name = "adb reconnect offline"; Run = { & adb reconnect offline 2>&1 | Out-Null } },
+        @{ Name = "adb disconnect + connect"; Run = {
+                & adb disconnect $serial 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 500
+                & adb connect $serial 2>&1 | Out-Null } },
+        @{ Name = "restart adb server"; Run = {
+                & adb kill-server 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 800
+                & adb start-server 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 800
+                & adb connect $serial 2>&1 | Out-Null } }
+    )
+
+    foreach ($step in $steps) {
+        Warn ("device is not ready - trying: " + $step.Name)
+        try { & $step.Run } catch { }
+        $deadline = (Get-Date).AddSeconds($timeoutSec)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            if ((Get-AdbState $serial) -eq "device") {
+                Ok ("device ready after: " + $step.Name)
+                return $true
+            }
+        }
+    }
+
+    Bad "device still '$(Get-AdbState $serial)' after every recovery step."
+    Write-Host "   Close BlueStacks completely, adb kill-server, reopen it, then adb connect $serial" -ForegroundColor Yellow
+    return $false
+}
+
+if (-not (Wait-AdbDevice $Serial)) { exit 1 }
+
 $whoami = (Sh "id") -join " "
 Write-Host "   su id -> $whoami"
 if ($whoami -notmatch "uid=0") {

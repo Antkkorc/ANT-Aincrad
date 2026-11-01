@@ -403,3 +403,41 @@ ContentProvider, and replacing `android.widget.Switch` (theme-attribute hungry,
 inflated with the application theme from a Service context) with a plain Button.
 
 `add_floating_menu.ps1 -Remove` reverts everything if needed.
+
+---
+
+## 13. "adb: device offline"
+
+Not an app fault. `device offline` means the adb **transport** is stale — BlueStacks
+restarts its `adbd` whenever the VM pauses, resumes or the window is minimised, and
+the host-side connection keeps the old handle.
+
+`fix_ffmodroot.ps1` and `deploy_ff.ps1` now both call `Wait-AdbDevice`, which walks
+the ladder automatically and re-checks `adb get-state` between steps:
+
+| step | command |
+|---|---|
+| 1 | `adb reconnect offline` |
+| 2 | `adb disconnect <serial>` then `adb connect <serial>` |
+| 3 | `adb kill-server`, `adb start-server`, `adb connect <serial>` |
+| 4 | give up with the exact manual sequence |
+
+`fix_ffmodroot.ps1` additionally retries `adb install` twice, re-running the
+recovery if the device drops mid-install, and on
+`INSTALL_FAILED_UPDATE_INCOMPATIBLE` / signature mismatch it uninstalls first.
+
+States that are *not* "offline" and mean something else:
+
+| `adb get-state` | meaning |
+|---|---|
+| `device` | good |
+| `offline` | stale transport — the ladder above fixes it |
+| `unauthorized` | the "Allow USB debugging?" prompt is pending inside the emulator |
+| `absent` | the TCP connection is not established at all: `adb connect <serial>` |
+
+If it never comes back, the APK is already built and valid. Install it by hand
+once the device answers:
+
+```
+adb -s 127.0.0.1:5555 install -r "C:\Users\anton\AndroidStudioProjects\FFMODROOT\app\build\outputs\apk\debug\app-debug.apk"
+```
