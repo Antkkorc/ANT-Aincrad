@@ -311,19 +311,19 @@ static void* init_thread(void*) {
     }
     LOGI("base=0x%lx", (unsigned long)base);
 
-    g_fn.current_match   = (void*(*)())            (base + FFV::CurrentMatch);
-    g_fn.player_by_idx   = (void*(*)(void*, int))  (base + FFV::GetPlayerByIdx);
-    g_fn.cur_hp          = (int (*)(void*))        (base + FFV::get_CurHP);
-    g_fn.is_local_player = (bool(*)(void*))        (base + FFV::IsLocalPlayer);
-    g_fn.is_firing       = (bool(*)(void*))        (base + FFV::IsFiring);
-    g_fn.is_sighting     = (bool(*)(void*))        (base + FFV::get_IsSighting);
-    g_fn.is_teammate     = (bool(*)(void*))        (base + FFV::IsLocalTeammate);
-    g_fn.is_dieing       = (bool(*)(void*))        (base + FFV::get_IsDieing);
-    g_fn.is_visible      = (bool(*)(void*))        (base + FFV::IsVisible);
-    g_fn.is_crouching    = (bool(*)(void*))        (base + FFV::IsCrouching);
-    g_fn.is_sky_diving   = (bool(*)(void*))        (base + FFV::get_IsSkyDiving);
-    g_fn.is_sky_dashing  = (bool(*)(void*))        (base + FFV::get_IsSkyDashing);
-    g_fn.get_position    = (void*(*)(void*))       (base + FFV::Transform_get_position);
+    g_fn.current_match   = reinterpret_cast<void*(*)()>           (base + FFV::CurrentMatch);
+    g_fn.player_by_idx   = reinterpret_cast<void*(*)(void*, int)> (base + FFV::GetPlayerByIdx);
+    g_fn.cur_hp          = reinterpret_cast<int (*)(void*)>       (base + FFV::get_CurHP);
+    g_fn.is_local_player = reinterpret_cast<bool(*)(void*)>       (base + FFV::IsLocalPlayer);
+    g_fn.is_firing       = reinterpret_cast<bool(*)(void*)>       (base + FFV::IsFiring);
+    g_fn.is_sighting     = reinterpret_cast<bool(*)(void*)>       (base + FFV::get_IsSighting);
+    g_fn.is_teammate     = reinterpret_cast<bool(*)(void*)>       (base + FFV::IsLocalTeammate);
+    g_fn.is_dieing       = reinterpret_cast<bool(*)(void*)>       (base + FFV::get_IsDieing);
+    g_fn.is_visible      = reinterpret_cast<bool(*)(void*)>       (base + FFV::IsVisible);
+    g_fn.is_crouching    = reinterpret_cast<bool(*)(void*)>       (base + FFV::IsCrouching);
+    g_fn.is_sky_diving   = reinterpret_cast<bool(*)(void*)>       (base + FFV::get_IsSkyDiving);
+    g_fn.is_sky_dashing  = reinterpret_cast<bool(*)(void*)>       (base + FFV::get_IsSkyDashing);
+    g_fn.get_position    = reinterpret_cast<void*(*)(void*)>      (base + FFV::Transform_get_position);
 
     uintptr_t aim_addr = base + FFV::SetAimRotation;
     if (!prologue_ok(aim_addr)) {

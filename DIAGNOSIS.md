@@ -207,3 +207,37 @@ with smoothing ≈ 3 ticks) ever execute.
 | `deploy_ff.ps1` | preloads the module into Free Fire, verifies it, tails the log |
 | `create_java_wrappers.ps1` | **removed** — it was generating the duplicate classes |
 | `build_and_launch.ps1` | **removed** — superseded by the two scripts above |
+
+---
+
+## 6. Building the module with a modern NDK
+
+`ndk-build` aborts on this project with NDK 30:
+
+```
+Android NDK: APP_PLATFORM not set. Defaulting to minimum supported version android-21.
+add-application.mk:88: *** Android NDK: Aborting...
+```
+
+Nothing in `jni/` had been compiled since. `build_native.ps1` now drives the
+NDK's `clang++` directly instead:
+
+```
+aarch64-linux-android<api>-clang++ --target=aarch64-linux-android<api> \
+    -shared -fPIC -O2 -std=c++17 -fno-exceptions -fno-rtti -nostdlib++ \
+    -Ijni core.cpp -Lprebuilt/arm64-v8a -lshadowhook -llog -lm \
+    -o libs/arm64-v8a/libant_aincrad.so
+```
+
+It picks the API level your NDK actually ships (`24` when available, otherwise
+the lowest `>= 21`), so it works on r26, r28 and r30 alike.
+
+`-nostdlib++` is deliberate: `core.cpp` uses only the header-only parts of
+`<atomic>`, so no libc++ symbols are emitted (verified with `nm -u`). That keeps
+the new module off the older, 9.4 MB `libc++_shared.so` the app currently ships
+and avoids an ABI mismatch.
+
+The script then verifies the result with the NDK's `llvm-nm` and fails if any of
+the 11 `Java_com_ffmodroot_*` entry points or `_Z16ant_aincrad_initv` is
+missing — i.e. it refuses to hand you a `.so` that would crash with
+`UnsatisfiedLinkError` again.
