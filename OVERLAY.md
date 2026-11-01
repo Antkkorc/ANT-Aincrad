@@ -168,3 +168,52 @@ adb -s 127.0.0.1:5555 logcat -b crash -d -t 40
 ```
 
 The first `Caused by:` line is the only thing needed to fix it.
+
+## The greyed-out "Display over other apps" switch
+
+On BlueStacks the Settings switch is often rendered **disabled** — the label is
+greyed and tapping does nothing. That screen is only a front-end to the same
+`AppOps` value adb writes, so the switch being grey does **not** mean the grant
+is impossible.
+
+Set it directly:
+
+```powershell
+adb -s 127.0.0.1:5555 shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow
+adb -s 127.0.0.1:5555 shell appops get com.ffmodroot SYSTEM_ALERT_WINDOW
+```
+
+The second command must print `SYSTEM_ALERT_WINDOW: allow`. If it prints
+`default`, `deny` or `ignore`, the set did not take — try:
+
+```powershell
+adb -s 127.0.0.1:5555 shell appops set --uid com.ffmodroot SYSTEM_ALERT_WINDOW allow
+adb -s 127.0.0.1:5555 shell pm grant com.ffmodroot android.permission.SYSTEM_ALERT_WINDOW
+```
+
+`add_floating_menu.ps1 -Grant` now does all of this automatically and reports the
+state before and after:
+
+```
+   appops before -> default
+   appops after  -> allow
+   [OK] overlay permission granted
+```
+
+It also waits for an offline device to come back first, verifies the package is
+actually installed (`appops` on a missing package silently no-ops, which is how
+the earlier `-Grant` run failed without telling anyone), and retries through `su`
+if the plain shell user is refused.
+
+### The menu no longer needs a relaunch
+
+`OverlayMenuService` used to call `stopSelf()` when the permission was missing.
+It now keeps a foreground service alive and **re-checks every 1.5 s**, so you can
+grant the AppOp from adb while the app is already running and the menu appears a
+second later:
+
+```
+I ANT-Aincrad-Overlay: SYSTEM_ALERT_WINDOW not granted yet - waiting for it
+I ANT-Aincrad-Overlay: overlay permission granted - showing menu
+I ANT-Aincrad-Overlay: menu displayed
+```

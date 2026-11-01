@@ -271,9 +271,14 @@ class OverlayMenuService : Service() {
 
         startForegroundNotice()
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-            Log.e(TAG, "SYSTEM_ALERT_WINDOW not granted - menu not shown")
-            stopSelf()
+        // Do NOT stopSelf() when the permission is missing. The user usually
+        // grants it *after* launching the app (and on BlueStacks the Settings
+        // switch is greyed out, so they have to do it over adb), so wait for it
+        // instead of dying and requiring another launch.
+        if (!canDrawOverlays()) {
+            Log.e(TAG, "SYSTEM_ALERT_WINDOW not granted yet - waiting for it")
+            Log.e(TAG, "grant with: adb shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow")
+            ui.post(permissionWatcher)
             return
         }
 
@@ -284,6 +289,31 @@ class OverlayMenuService : Service() {
         }
 
         ui.postDelayed(ticker, 1000L)
+    }
+
+    private fun canDrawOverlays(): Boolean {
+        return Build.VERSION.SDK_INT < Build.VERSION_CODES.M || Settings.canDrawOverlays(this)
+    }
+
+    /**
+     * Re-checks the overlay permission every 1.5 s until it is granted, then
+     * shows the menu. Lets the user grant it from adb (or Settings) while the
+     * app is already running - no relaunch needed.
+     */
+    private val permissionWatcher = object : Runnable {
+        override fun run() {
+            if (canDrawOverlays()) {
+                Log.i(TAG, "overlay permission granted - showing menu")
+                try {
+                    showMenu()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "showMenu failed: " + t)
+                }
+                ui.postDelayed(ticker, 1000L)
+                return
+            }
+            ui.postDelayed(this, 1500L)
+        }
     }
 
     override fun onDestroy() {
@@ -906,18 +936,97 @@ Ok "manifest saved (UTF-8, no BOM)"
 # ---------------------------------------------------------------------------
 if ($Grant) {
     Step 6 "Granting SYSTEM_ALERT_WINDOW over adb"
-    $devices = (& adb devices) -join "`n"
-    if ($devices -notmatch [regex]::Escape($Serial)) {
-        Warn "$Serial not connected - running adb connect"
-        & adb connect $Serial | Out-Host
+
+    # The Settings switch is greyed out on BlueStacks, so the adb appop is the
+    # ONLY way in. It also has to work when the device dropped offline.
+    function Get-AdbState([string] $serial) {
+        $out = (& adb -s $serial get-state 2>&1) -join " "
+        if ($out -match "device")       { return "device" }
+        if ($out -match "offline")      { return "offline" }
+        if ($out -match "unauthorized") { return "unauthorized" }
+        return "absent"
     }
+
+    function Wait-AdbDevice([string] $serial, [int] $timeoutSec = 45) {
+        if ((Get-AdbState $serial) -eq "device") { return $true }
+        $steps = @(
+            @{ Name = "adb reconnect offline"; Run = { & adb reconnect offline 2>&1 | Out-Null } },
+            @{ Name = "adb disconnect + connect"; Run = {
+                    & adb disconnect $serial 2>&1 | Out-Null
+                    Start-Sleep -Milliseconds 500
+                    & adb connect $serial 2>&1 | Out-Null } },
+            @{ Name = "restart adb server"; Run = {
+                    & adb kill-server 2>&1 | Out-Null
+                    Start-Sleep -Milliseconds 800
+                    & adb start-server 2>&1 | Out-Null
+                    Start-Sleep -Milliseconds 800
+                    & adb connect $serial 2>&1 | Out-Null } }
+        )
+        foreach ($step in $steps) {
+            Warn ("device not ready - trying: " + $step.Name)
+            try { & $step.Run } catch { }
+            $deadline = (Get-Date).AddSeconds($timeoutSec)
+            while ((Get-Date) -lt $deadline) {
+                Start-Sleep -Seconds 2
+                if ((Get-AdbState $serial) -eq "device") { Ok ("ready after: " + $step.Name); return $true }
+            }
+        }
+        Bad "device still '$(Get-AdbState $serial)'."
+        Write-Host "   Close BlueStacks fully, run 'adb kill-server', reopen it, then re-run this script." -ForegroundColor Yellow
+        return $false
+    }
+
+    function Read-AppOp {
+        $out = (& adb -s $Serial shell appops get $Package SYSTEM_ALERT_WINDOW 2>&1) -join " "
+        if ($out -match "allow")   { return "allow" }
+        if ($out -match "deny")    { return "deny" }
+        if ($out -match "ignore")  { return "ignore" }
+        if ($out -match "default") { return "default" }
+        return "unknown: $out"
+    }
+
+    if (-not (Wait-AdbDevice $Serial)) { exit 1 }
+
+    # Is the package even installed? appops on a missing package silently no-ops.
+    $installed = ((& adb -s $Serial shell pm list packages $Package 2>&1) -join " ")
+    if ($installed -notmatch [regex]::Escape($Package)) {
+        Bad "$Package is not installed on this device"
+        Bad "install the APK first: powershell -ExecutionPolicy Bypass -File .\\fix_ffmodroot.ps1"
+        exit 1
+    }
+    Ok "$Package is installed"
+
+    $before = Read-AppOp
+    Write-Host "   appops before -> $before"
+
+    # Attempt 1: plain appops as the shell user.
     & adb -s $Serial shell appops set $Package SYSTEM_ALERT_WINDOW allow 2>&1 | Out-Host
-    $state = (& adb -s $Serial shell appops get $Package SYSTEM_ALERT_WINDOW) -join " "
-    Write-Host "   appops -> $state"
-    if ($state -match "allow") { Ok "overlay permission granted" }
-    else {
-        Bad "grant did not take. Rooted fallback:"
-        Write-Host "      adb -s $Serial shell su -c 'appops set $Package SYSTEM_ALERT_WINDOW allow'" -ForegroundColor White
+    Start-Sleep -Milliseconds 600
+    $after = Read-AppOp
+    Write-Host "   appops after  -> $after"
+
+    # Attempt 2: rooted. Some BlueStacks images only accept it as uid 0.
+    if ($after -notmatch "allow") {
+        Warn "plain appops did not take - trying as root"
+        & adb -s $Serial shell su -c "appops set $Package SYSTEM_ALERT_WINDOW allow" 2>&1 | Out-Host
+        Start-Sleep -Milliseconds 600
+        $after = Read-AppOp
+        Write-Host "   appops after root -> $after"
+    }
+
+    if ($after -match "allow") {
+        Ok "overlay permission granted"
+        Write-Host ""
+        Write-Host "   The greyed-out Settings switch is cosmetic - it reads the same AppOp" -ForegroundColor Yellow
+        Write-Host "   this command just wrote. The menu will appear within ~1.5 s if the app" -ForegroundColor Yellow
+        Write-Host "   is running, without relaunching." -ForegroundColor Yellow
+    } else {
+        Bad "could not set the AppOp (state: $after)"
+        Write-Host "   Manual attempts, in order:" -ForegroundColor Yellow
+        Write-Host "     adb -s $Serial shell appops set --uid $Package SYSTEM_ALERT_WINDOW allow" -ForegroundColor White
+        Write-Host "     adb -s $Serial shell pm grant $Package android.permission.SYSTEM_ALERT_WINDOW" -ForegroundColor White
+        Write-Host "     adb -s $Serial shell am start -a android.settings.action.MANAGE_OVERLAY_PERMISSION -d package:$Package" -ForegroundColor White
+        exit 1
     }
 } else {
     Step 6 "Overlay permission"
