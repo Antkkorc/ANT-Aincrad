@@ -113,3 +113,58 @@ One line per feature. The native side needs a matching
 `Java_com_ffmodroot_ModBridge_setXxxEnabled` export in `jni/core.cpp` plus an
 `external fun` in `ModBridge.kt`; `build_native.ps1` will refuse to finish if the
 symbol is missing.
+
+## If the app crashes after adding the overlay
+
+Three failure modes were possible and are now handled defensively:
+
+**1. ABI mismatch (most likely on BlueStacks).** BlueStacks runs an **x86_64**
+process (`Unexpected CPU variant for X86 using defaults: x86_64`), while the APK
+ships `arm64-v8a` only. `System.loadLibrary("ant_aincrad")` then throws
+`UnsatisfiedLinkError`, which becomes `ExceptionInInitializerError` on every
+later reference.
+
+The overlay used to call `ModBridge` every second from a Service, so it hit this
+at startup. Now `nativeLibPresent()` checks
+`applicationInfo.nativeLibraryDir/libant_aincrad.so` **before** any `ModBridge`
+access, and the status line says so:
+
+```
+no arm64 native library for this ABI
+(this emulator reports x86_64)
+toggles saved, hooks unavailable
+```
+
+`Injector` loads with `runCatching`, so referencing it can never throw either.
+The toggles still work and are still written to the config file — only the hooks
+are unavailable.
+
+**2. A throwing ContentProvider.** `OverlayAutoStart.onCreate()` runs before any
+Activity exists; an exception there is indistinguishable from "the app crashes on
+launch". The whole body is wrapped in try/catch and logs instead.
+
+**3. `android.widget.Switch`.** It resolves `switchStyle` /
+`colorControlActivated` from the theme, and a Service is inflated with the
+*application* theme. A Compose-only theme can leave those undefined and throw
+`Resources.NotFoundException` while building the view. Replaced with a plain
+`Button` showing `ON` / `OFF`.
+
+### Instant revert
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\add_floating_menu.ps1 -Remove
+powershell -ExecutionPolicy Bypass -File .\fix_ffmodroot.ps1
+```
+
+`-Remove` deletes `OverlayMenuService.kt`, `OverlayAutoStart.kt`, `Injector.kt`,
+strips the two silent-aim externals out of `ModBridge.kt`, and removes the
+service, provider and permissions from the manifest — putting the project back to
+the last known-good app.
+
+### Getting the actual crash
+
+```powershell
+adb -s 127.0.0.1:5555 logcat -b crash -d -t 40
+```
+
+The first `Caused by:` line is the only thing needed to fix it.
