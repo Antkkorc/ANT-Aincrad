@@ -32,8 +32,10 @@ an `eglSwapBuffers` hook. That is a different piece of software.)
 
 | file | role |
 |---|---|
-| `OverlayMenuService.kt` | foreground Service that adds a `TYPE_APPLICATION_OVERLAY` window: draggable title, collapse chevron, switches for Aim assist / Antiban / Lobby bypass / Game bypass, live `mod= …  lobby= …  game= …` status line, Close button |
+| `OverlayMenuService.kt` | foreground Service that adds a `TYPE_APPLICATION_OVERLAY` window. **Gated:** it shows one `INJECT BYPASS` button first; pressing it enables the bypasses, calls `Injector.initHooks()`, then reveals the feature list (Silent Aim). Draggable title, collapse chevron (body only), live status, Close |
 | `OverlayAutoStart.kt` | `ContentProvider` that starts the service when the app process comes up, so `MainActivity.kt` does not have to be edited |
+| `Injector.kt` | Kotlin `object` matching the JNI symbols the library already exports (`initHooks`, `getIl2cppBase`). Kotlin, not Java — a `.java` here reproduces the duplicate-class failure |
+| `ModBridge.kt` | only appends `setSilentAimEnabled` / `isSilentAimActive` if missing; the rest of the file is untouched |
 | `AndroidManifest.xml` | `SYSTEM_ALERT_WINDOW`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`, `POST_NOTIFICATIONS`, plus the `<service>` and `<provider>` |
 
 The switches call the **same** `ModBridge.setXxxEnabled()` functions the Compose
@@ -79,3 +81,35 @@ adb -s 127.0.0.1:5555 logcat -s ANT-Aincrad-Overlay
   if you want it and I will scope it.
 * Toggling a switch is only half the job — the hooks still have to be loaded
   inside Free Fire with `deploy_ff.ps1`.
+
+## The inject gate
+
+The menu deliberately behaves like an Aincrad-style client: **features are locked
+until you press INJECT BYPASS.**
+
+What that button really does:
+
+1. switches both bypass flags on (lobby + game),
+2. calls `Injector.initHooks()` in this process,
+3. reports the truth.
+
+In the launcher process `libil2cpp.so` is never mapped, so step 3 says *hooks NOT
+installed* in red and names `deploy_ff.ps1`. The feature list unlocks anyway so
+you can see and set Silent Aim — but the status line keeps telling you the hooks
+are not live until they actually are. It will not pretend.
+
+The gate state persists in `SharedPreferences`, so a second launch goes straight
+to the feature list.
+
+## Adding features later
+
+`showMenu()` builds the list with:
+
+```kotlin
+addToggle(features, "Silent aim", "silent_aim") { on -> ModBridge.setSilentAimEnabled(on) }
+```
+
+One line per feature. The native side needs a matching
+`Java_com_ffmodroot_ModBridge_setXxxEnabled` export in `jni/core.cpp` plus an
+`external fun` in `ModBridge.kt`; `build_native.ps1` will refuse to finish if the
+symbol is missing.

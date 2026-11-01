@@ -287,6 +287,8 @@ if ($nm) {
         "Java_com_ffmodroot_ModBridge_setGameBypassEnabled"
         "Java_com_ffmodroot_ModBridge_isLobbyBypassActive"
         "Java_com_ffmodroot_ModBridge_isGameBypassActive"
+        "Java_com_ffmodroot_ModBridge_setSilentAimEnabled"
+        "Java_com_ffmodroot_ModBridge_isSilentAimActive"
         "Java_com_ffmodroot_Dumper_getBase"
         "Java_com_ffmodroot_Dumper_dumpOffsets"
         "Java_com_ffmodroot_Injector_initHooks"
