@@ -45,6 +45,69 @@ function Warn($m) { Write-Host "   [WARN] $m" -ForegroundColor Yellow }
 function Bad($m)  { Write-Host "   [FAIL] $m" -ForegroundColor Red }
 
 # ---------------------------------------------------------------------------
+# adb device recovery
+# ---------------------------------------------------------------------------
+# "adb: device offline" means the adb *transport* is stale, not that the app is
+# broken. It happens constantly with BlueStacks because the emulator restarts
+# its adbd when the VM pauses/resumes. Walk the standard ladder instead of
+# making the user do it by hand.
+function Get-AdbState([string] $serial) {
+    $out = (& adb -s $serial get-state 2>&1) -join " "
+    if ($out -match "device")   { return "device" }
+    if ($out -match "offline")  { return "offline" }
+    if ($out -match "unauthorized") { return "unauthorized" }
+    return "absent"
+}
+
+function Wait-AdbDevice([string] $serial, [int] $timeoutSec = 45) {
+    if ((Get-AdbState $serial) -eq "device") { return $true }
+
+    $steps = @(
+        @{ Name = "adb reconnect offline"; Run = { & adb reconnect offline 2>&1 | Out-Null } },
+        @{ Name = "adb disconnect + connect"; Run = {
+                & adb disconnect $serial 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 500
+                & adb connect $serial 2>&1 | Out-Null } },
+        @{ Name = "restart adb server"; Run = {
+                & adb kill-server 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 800
+                & adb start-server 2>&1 | Out-Null
+                Start-Sleep -Milliseconds 800
+                & adb connect $serial 2>&1 | Out-Null } }
+    )
+
+    foreach ($step in $steps) {
+        Warn ("device is not ready - trying: " + $step.Name)
+        try { & $step.Run } catch { }
+        $deadline = (Get-Date).AddSeconds($timeoutSec)
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 2
+            if ((Get-AdbState $serial) -eq "device") {
+                Ok ("device ready after: " + $step.Name)
+                return $true
+            }
+        }
+    }
+
+    # Last resort: a full emulator restart is the only thing left.
+    $state = Get-AdbState $serial
+    Bad "device still '$state' after every recovery step."
+    Write-Host ""
+    Write-Host "   Do this once, then re-run the script:" -ForegroundColor Yellow
+    Write-Host "     1. In BlueStacks: close the emulator completely (not minimise)" -ForegroundColor White
+    Write-Host "     2. adb kill-server" -ForegroundColor White
+    Write-Host "     3. Start BlueStacks, wait for the home screen" -ForegroundColor White
+    Write-Host "     4. adb connect $serial" -ForegroundColor White
+    Write-Host "     5. adb devices   # must say 'device', not 'offline'" -ForegroundColor White
+    Write-Host ""
+    Write-Host "   The APK is already built and valid:" -ForegroundColor Yellow
+    Write-Host "     $apk" -ForegroundColor White
+    Write-Host "   Install it yourself once the device is back:" -ForegroundColor Yellow
+    Write-Host "     adb -s $serial install -r `"$apk`"" -ForegroundColor White
+    return $false
+}
+
+# ---------------------------------------------------------------------------
 # 0. sanity
 # ---------------------------------------------------------------------------
 Step 0 "Checking project layout"
@@ -232,16 +295,36 @@ Step 6 "Deploying to $Serial"
 $prevEap2 = $ErrorActionPreference
 $ErrorActionPreference = "Continue"
 try {
-$devices = (& adb devices) -join "`n"
-if ($devices -notmatch [regex]::Escape($Serial)) {
-    Warn "$Serial not listed - trying adb connect"
-    & adb connect $Serial | Out-Host
-}
+if (-not (Wait-AdbDevice $Serial)) { exit 1 }
 
 & adb -s $Serial shell am force-stop $Package 2>&1 | Out-Null
 & adb -s $Serial uninstall $Package 2>&1 | Out-Null
-& adb -s $Serial install -r $apk 2>&1 | Out-Host
-if ($LASTEXITCODE -ne 0) { Bad "adb install failed"; exit 1 }
+
+$installOk = $false
+for ($attempt = 1; $attempt -le 2; $attempt++) {
+    $installOut = (& adb -s $Serial install -r $apk 2>&1) -join "`n"
+    $installOut | Out-Host
+    if ($installOut -match "Success") { $installOk = $true; break }
+
+    if ($installOut -match "offline") {
+        Warn "device went offline mid-install (attempt $attempt) - recovering"
+        if (-not (Wait-AdbDevice $Serial)) { exit 1 }
+    } elseif ($installOut -match "INSTALL_FAILED_UPDATE_INCOMPATIBLE|signatures do not match") {
+        Warn "signature mismatch - doing a clean uninstall first"
+        & adb -s $Serial uninstall $Package 2>&1 | Out-Host
+        if (-not (Wait-AdbDevice $Serial)) { exit 1 }
+    } else {
+        break
+    }
+}
+
+if (-not $installOk) {
+    Bad "adb install failed - the APK is built and valid:"
+    Write-Host "     $apk" -ForegroundColor White
+    Write-Host "   Retry manually once the device is responsive:" -ForegroundColor Yellow
+    Write-Host "     adb -s $Serial install -r `"$apk`"" -ForegroundColor White
+    exit 1
+}
 Ok "installed"
 
 # ---------------------------------------------------------------------------
