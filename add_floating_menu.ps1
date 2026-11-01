@@ -257,8 +257,16 @@ class OverlayMenuService : Service() {
 
     private val ticker = object : Runnable {
         override fun run() {
-            refreshStatus()
-            ui.postDelayed(this, 1000L)
+            // Any throw on the main thread kills the process. The status line is
+            // cosmetic, so it must never be able to take the app down - and it
+            // must keep ticking even if one refresh fails.
+            try {
+                refreshStatus()
+            } catch (t: Throwable) {
+                Log.w(TAG, "refreshStatus failed: " + t)
+            } finally {
+                ui.postDelayed(this, 1000L)
+            }
         }
     }
 
@@ -302,7 +310,14 @@ class OverlayMenuService : Service() {
      */
     private val permissionWatcher = object : Runnable {
         override fun run() {
-            if (canDrawOverlays()) {
+            var granted = false
+            try {
+                granted = canDrawOverlays()
+            } catch (t: Throwable) {
+                Log.w(TAG, "canDrawOverlays failed: " + t)
+            }
+
+            if (granted) {
                 Log.i(TAG, "overlay permission granted - showing menu")
                 try {
                     showMenu()

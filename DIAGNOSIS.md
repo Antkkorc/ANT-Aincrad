@@ -441,3 +441,42 @@ once the device answers:
 ```
 adb -s 127.0.0.1:5555 install -r "C:\Users\anton\AndroidStudioProjects\FFMODROOT\app\build\outputs\apk\debug\app-debug.apk"
 ```
+
+---
+
+## 14. Crash when tapping "Free Fire" / "Free Fire Max"
+
+The app's game-selection buttons live in `MainActivity` inside
+`AndroidStudioProjects\FFMODROOT` — **not in this repo**, so the source could not
+be inspected directly. `diag_crash.ps1` exists to close that gap: it launches the
+app, waits while you tap the button that crashes, then prints the stack trace
+**and** the source lines behind each `com.ffmodroot.` frame.
+
+### Candidate causes, in likelihood order
+
+| # | cause | signature in the stack |
+|---|---|---|
+| 1 | native call on a mismatched ABI — `ModBridge` is a Kotlin `object`, so the first touch runs `System.loadLibrary` and throws `UnsatisfiedLinkError` → `ExceptionInInitializerError` | `java.lang.UnsatisfiedLinkError: dlopen failed ... arm64-v8a` |
+| 2 | `startActivity` for a game that is not installed / has no launcher activity | `ActivityNotFoundException` |
+| 3 | root shell call that fails on this image | `SecurityException` / `IOException` |
+| 4 | the overlay's main-thread ticker throwing | `Exception` with `OverlayMenuService` frames |
+
+Only #4 is code this repo controls, and it is now impossible: both
+`ticker` and `permissionWatcher` wrap their whole body in
+`try/catch/finally` and always re-post.
+
+### Facts that rule things out
+
+* `startForeground` was already wrapped — a missing `FOREGROUND_SERVICE`
+  permission cannot crash the app.
+* `OverlayAutoStart.onCreate` is fully wrapped, so the provider cannot kill the
+  process before an Activity exists.
+* `Injector` uses `runCatching { System.loadLibrary(...) }` plus a `loaded` flag,
+  so it cannot throw `ExceptionInInitializerError`.
+
+### If #1 is the cause
+
+Nothing in the menu can fix it. BlueStacks runs x86_64; the APK ships
+`arm64-v8a` only, and `libshadowhook.so` has no x86_64 build available. The app
+must stop calling native code unconditionally from the UI — see the
+`nativeLibPresent()` guard pattern in `OverlayMenuService` for how to gate it.
