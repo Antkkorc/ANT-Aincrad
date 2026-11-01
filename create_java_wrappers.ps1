@@ -8,6 +8,11 @@ if (!(Test-Path $BASE_PATH)) {
     Write-Host "Created directory: $BASE_PATH"
 }
 
+# Helper to write file without BOM
+function Write-FileNoBOM($path, $content) {
+    [System.IO.File]::WriteAllText($path, $content, [System.Text.Encoding]::UTF8)
+}
+
 # 1. ModBridge.java
 $modBridgeContent = @"
 package com.ffmodroot;
@@ -32,9 +37,8 @@ public class ModBridge {
     }
 }
 "@
-$modBridgePath = Join-Path $BASE_PATH "ModBridge.java"
-$modBridgeContent | Set-Content -Path $modBridgePath -Encoding UTF8
-Write-Host "Created: $modBridgePath"
+Write-FileNoBOM (Join-Path $BASE_PATH "ModBridge.java") $modBridgeContent
+Write-Host "Created: ModBridge.java"
 
 # 2. Dumper.java
 $dumperContent = @"
@@ -49,9 +53,8 @@ public class Dumper {
     public native String dumpOffsets();
 }
 "@
-$dumperPath = Join-Path $BASE_PATH "Dumper.java"
-$dumperContent | Set-Content -Path $dumperPath -Encoding UTF8
-Write-Host "Created: $dumperPath"
+Write-FileNoBOM (Join-Path $BASE_PATH "Dumper.java") $dumperContent
+Write-Host "Created: Dumper.java"
 
 # 3. Injector.java
 $injectorContent = @"
@@ -66,9 +69,8 @@ public class Injector {
     public native String getIl2cppBase();
 }
 "@
-$injectorPath = Join-Path $BASE_PATH "Injector.java"
-$injectorContent | Set-Content -Path $injectorPath -Encoding UTF8
-Write-Host "Created: $injectorPath"
+Write-FileNoBOM (Join-Path $BASE_PATH "Injector.java") $injectorContent
+Write-Host "Created: Injector.java"
 
 # 4. MainActivity.java
 $mainActivityContent = @"
@@ -103,8 +105,6 @@ public class MainActivity extends Activity {
     }
 }
 "@
-$mainActivityPath = Join-Path $BASE_PATH "MainActivity.java"
-$mainActivityContent | Set-Content -Path $mainActivityPath -Encoding UTF8
-Write-Host "Created: $mainActivityPath"
+Write-FileNoBOM (Join-Path $BASE_PATH "MainActivity.java") $mainActivityContent
 
-Write-Host "All Java wrapper classes created successfully. Proceed to build with Gradle."
+Write-Host "SUCCESS: Java wrapper classes created in $BASE_PATH (UTF-8, NO BOM)"
