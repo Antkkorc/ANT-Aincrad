@@ -202,6 +202,54 @@ if (Test-Path $JniLibs) {
 if ($script:failed) { exit 1 }
 
 # ---------------------------------------------------------------------------
+# 4b. overlay permission must be DECLARED in the manifest, not just appops'd
+# ---------------------------------------------------------------------------
+# Proves itself in the failure message:
+#     Security exception: Package com.ffmodroot has not requested permission
+#     android.permission.SYSTEM_ALERT_WINDOW
+# That happens when add_floating_menu.ps1 patched the source manifest AFTER the
+# APK was built, so the installed APK never declared it. An AppOp of "allow"
+# cannot compensate: Settings.canDrawOverlays() still returns false and
+# addView(TYPE_APPLICATION_OVERLAY) throws.
+Step "4b" "Checking the overlay permission in AndroidManifest.xml"
+$manifest = Join-Path $AppDir "src\main\AndroidManifest.xml"
+if (-not (Test-Path $manifest)) {
+    Warn "manifest not found at $manifest - skipping"
+} else {
+    $overlayService = Join-Path $JavaDir "OverlayMenuService.kt"
+    $raw = [System.IO.File]::ReadAllText($manifest)
+    $declared = $raw -match 'SYSTEM_ALERT_WINDOW'
+
+    if ($declared) {
+        Ok "SYSTEM_ALERT_WINDOW is declared"
+    } elseif (Test-Path $overlayService) {
+        Warn "OverlayMenuService.kt exists but the manifest does not declare SYSTEM_ALERT_WINDOW"
+        Warn "adding it now (this is why 'pm grant' said 'has not requested permission')"
+        try {
+            $NS = "http://schemas.android.com/apk/res/android"
+            [xml]$doc = Get-Content -Raw $manifest
+            $root = $doc.DocumentElement
+            $el = $doc.CreateElement("uses-permission")
+            $el.SetAttribute("name", $NS, "android.permission.SYSTEM_ALERT_WINDOW")
+            [void]$root.PrependChild($el)
+            $xset = New-Object System.Xml.XmlWriterSettings
+            $xset.Indent = $true
+            $xset.IndentChars = "    "
+            $xset.Encoding = New-Object System.Text.UTF8Encoding($false)
+            $xw = [System.Xml.XmlWriter]::Create($manifest, $xset)
+            try { $doc.Save($xw) } finally { $xw.Close() }
+            Ok "SYSTEM_ALERT_WINDOW added to the manifest"
+        } catch {
+            Bad "could not patch the manifest: $($_.Exception.Message)"
+            $script:failed = $true
+        }
+    } else {
+        Ok "no overlay in this project - permission not needed"
+    }
+}
+if ($script:failed) { exit 1 }
+
+# ---------------------------------------------------------------------------
 # 5. clean build - hard stop on failure
 # ---------------------------------------------------------------------------
 Step 5 "Building the APK (clean, no stale artefacts)"
@@ -326,6 +374,36 @@ if (-not $installOk) {
     exit 1
 }
 Ok "installed"
+
+# ---------------------------------------------------------------------------
+# 6b. re-apply the overlay AppOp
+# ---------------------------------------------------------------------------
+# This script uninstalls the package before installing, which RESETS its AppOps.
+# So the grant has to be repeated after every install - otherwise the menu
+# silently never appears even though the manifest declares the permission.
+Step "6b" "Re-applying the SYSTEM_ALERT_WINDOW AppOp"
+$rawManifest2 = ""
+if (Test-Path $manifest) { $rawManifest2 = [System.IO.File]::ReadAllText($manifest) }
+
+if ($rawManifest2 -match "SYSTEM_ALERT_WINDOW") {
+    $opBefore = ((& adb -s $Serial shell appops get $Package SYSTEM_ALERT_WINDOW 2>&1) -join " ").Trim()
+    Write-Host "   appops before -> $opBefore"
+
+    if ($opBefore -notmatch "allow") {
+        & adb -s $Serial shell appops set $Package SYSTEM_ALERT_WINDOW allow 2>&1 | Out-Null
+        Start-Sleep -Milliseconds 600
+    }
+    $opAfter = ((& adb -s $Serial shell appops get $Package SYSTEM_ALERT_WINDOW 2>&1) -join " ").Trim()
+    Write-Host "   appops after  -> $opAfter"
+    if ($opAfter -match "allow") {
+        Ok "overlay AppOp is allow"
+    } else {
+        Warn "AppOp is '$opAfter' - the menu will not appear. Rooted fallback:"
+        Write-Host "     adb -s $Serial shell su -c 'appops set $Package SYSTEM_ALERT_WINDOW allow'" -ForegroundColor White
+    }
+} else {
+    Warn "manifest does not declare SYSTEM_ALERT_WINDOW - skipping (run add_floating_menu.ps1)"
+}
 
 # ---------------------------------------------------------------------------
 # 7. launch and capture the REAL runtime state

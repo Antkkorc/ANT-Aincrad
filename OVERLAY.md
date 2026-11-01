@@ -217,3 +217,43 @@ I ANT-Aincrad-Overlay: SYSTEM_ALERT_WINDOW not granted yet - waiting for it
 I ANT-Aincrad-Overlay: overlay permission granted - showing menu
 I ANT-Aincrad-Overlay: menu displayed
 ```
+
+## `pm grant` says "has not requested permission"
+
+```
+Security exception: Package com.ffmodroot has not requested permission
+android.permission.SYSTEM_ALERT_WINDOW
+```
+
+This is **not** an AppOp problem — it means the installed APK's manifest does not
+declare `SYSTEM_ALERT_WINDOW` at all. Two things cause it:
+
+1. `add_floating_menu.ps1` patched the **source** manifest after the APK had
+   already been built, so you installed a package that never declared it.
+2. The project was reverted with `-Remove` (which strips the permission), then
+   rebuilt, and `add_floating_menu.ps1` was not re-run.
+
+An AppOp of `allow` cannot compensate. Without the manifest entry
+`Settings.canDrawOverlays()` returns `false` and
+`addView(TYPE_APPLICATION_OVERLAY)` throws `BadTokenException`.
+
+`fix_ffmodroot.ps1` now:
+
+* **step 4b** — reads `app/src/main/AndroidManifest.xml` and, if
+  `OverlayMenuService.kt` exists but the permission is missing, adds
+  `<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>`
+  before building, and says why.
+* **step 6b** — after installing, re-applies the AppOp. This matters because the
+  script **uninstalls before installing**, which resets AppOps — so a grant from
+  an earlier run is wiped and the menu would silently never appear.
+
+Confirm the declaration on the device:
+
+```powershell
+adb -s 127.0.0.1:5555 shell dumpsys package com.ffmodroot | Select-String SYSTEM_ALERT_WINDOW
+```
+
+Empty output = the APK still does not declare it → rebuild, do not just re-grant.
+
+`pm grant` is the wrong tool for this permission on any Android version; it is an
+AppOp-backed permission, so `appops set` is the correct command.
