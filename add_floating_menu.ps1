@@ -1,7 +1,8 @@
 <#
   add_floating_menu.ps1
   =====================
-  Adds the missing in-game floating menu to FFMODROOT.
+  Adds the in-game floating menu, gated behind an INJECT BYPASS step, with
+  Silent Aim as the first feature.
 
   Why this is needed
   ------------------
@@ -9,35 +10,37 @@
 
     * libant_aincrad.so contains no UI code at all - 0 matches for
       imgui / egl / overlay / window / menu / button / motion, and it does not
-      link libEGL or libGLESv2. It only hooks SetAimRotation and sendto/send.
+      link libEGL or libGLESv2.
     * The APK contains MainActivity, MainActivityKt, ModBridge, RootInjector,
       Screen and ui/theme - no Service class, so no window could be added.
 
   What this script adds
   ---------------------
-    1. OverlayMenuService.kt  - a foreground Service that puts a draggable
-       window on top of everything (TYPE_APPLICATION_OVERLAY) with switches for
-       Aim / Antiban / Lobby bypass / Game bypass. The switches call the same
-       ModBridge functions the Compose UI calls, so the native module picks them
-       up (it polls /data/local/tmp/ant_aincrad.cfg every 500 ms).
-    2. OverlayAutoStart.kt    - a tiny ContentProvider that starts the service
-       when the app process comes up, so nothing has to be called from
-       MainActivity.kt (which we must not rewrite blind).
-    3. AndroidManifest.xml    - SYSTEM_ALERT_WINDOW + foreground-service
-       permissions, the <service> and the <provider>.
+    1. OverlayMenuService.kt - a foreground Service showing a draggable overlay.
+       Before injection it shows one button: INJECT BYPASS. After that it reveals
+       the feature list (Silent Aim now, more later) and a live status line.
+    2. OverlayAutoStart.kt   - ContentProvider that starts the service on launch,
+       so MainActivity.kt never has to be edited.
+    3. Injector.kt           - Kotlin object matching the JNI symbols the library
+       already exports (Java_com_ffmodroot_Injector_initHooks / getIl2cppBase).
+       Kotlin, not Java: a .java here would collide with the .kt files and
+       reproduce the duplicate-class build failure we already fixed.
+    4. ModBridge.kt          - appends the two new externals
+       (setSilentAimEnabled / isSilentAimActive) if they are missing. Everything
+       else in that file is left byte-for-byte alone.
+    5. AndroidManifest.xml   - SYSTEM_ALERT_WINDOW + foreground-service bits,
+       the <service> and the <provider>.
 
-  Overlay permission
-  ------------------
-  Android will not let an app draw over another app without SYSTEM_ALERT_WINDOW.
-  On a rooted BlueStacks the reliable way is one adb command, which this script
-  can run for you with -Grant:
-
-      adb shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow
+  Important
+  ---------
+  The menu gate does not do the real injection. Hooks only install inside the
+  Free Fire process, which is what deploy_ff.ps1 does (root, Zygote
+  wrap.<package>). The status line tells you which state you are in.
 
   Usage:
       powershell -ExecutionPolicy Bypass -File .\add_floating_menu.ps1
       powershell -ExecutionPolicy Bypass -File .\add_floating_menu.ps1 -Grant
-      powershell -ExecutionPolicy Bypass -File .\add_floating_menu.ps1 -ProjectRoot "D:\other\FFMODROOT" -Serial 127.0.0.1:5555
+      powershell -ExecutionPolicy Bypass -File .\add_floating_menu.ps1 -ProjectRoot "D:\x\FFMODROOT"
 #>
 
 [CmdletBinding()]
@@ -55,6 +58,11 @@ function Ok($m)   { Write-Host "   [OK]   $m" -ForegroundColor Green }
 function Warn($m) { Write-Host "   [WARN] $m" -ForegroundColor Yellow }
 function Bad($m)  { Write-Host "   [FAIL] $m" -ForegroundColor Red }
 
+$Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+function Write-Kt([string] $path, [string] $body) {
+    [System.IO.File]::WriteAllText($path, $body, $Utf8NoBom)
+}
+
 # ---------------------------------------------------------------------------
 Step 0 "Locating the Android project"
 # ---------------------------------------------------------------------------
@@ -67,10 +75,13 @@ if (-not (Test-Path $ProjectRoot)) {
 $AppDir   = Join-Path $ProjectRoot "app"
 $SrcDir   = Join-Path $AppDir "src\main\java\com\ffmodroot"
 $Manifest = Join-Path $AppDir "src\main\AndroidManifest.xml"
+$ModBridgeKt = Join-Path $SrcDir "ModBridge.kt"
 
 foreach ($p in @($AppDir, $SrcDir, $Manifest)) {
     if (Test-Path $p) { Ok $p } else { Bad "missing: $p"; exit 1 }
 }
+if (-not (Test-Path $ModBridgeKt)) { Bad "ModBridge.kt not found at $ModBridgeKt"; exit 1 }
+Ok $ModBridgeKt
 
 $compileSdk = 0
 $gradleApp = Join-Path $AppDir "build.gradle.kts"
@@ -116,11 +127,12 @@ import android.widget.Switch
 import android.widget.TextView
 
 /**
- * Draggable menu drawn over Free Fire.
+ * Draggable in-game menu.
  *
- * The switches call the same ModBridge entry points the Compose UI uses, and
- * libant_aincrad.so mirrors them to /data/local/tmp/ant_aincrad.cfg, which the
- * copy of the module running inside the game re-reads every 500 ms.
+ * Flow: INJECT BYPASS first, features after - matching how Aincrad-style clients
+ * behave. The gate is honest about its own state: it unlocks the feature list,
+ * but the status line stays red until the hooks are actually installed inside
+ * Free Fire (deploy_ff.ps1 does that; nothing here can).
  */
 class OverlayMenuService : Service() {
 
@@ -129,6 +141,7 @@ class OverlayMenuService : Service() {
         private const val CHANNEL_ID = "ant_aincrad_overlay"
         private const val NOTIF_ID = 4242
         private const val PREFS = "ant_aincrad_overlay"
+        private const val K_INJECTED = "injected"
 
         fun start(ctx: Context) {
             val i = Intent(ctx, OverlayMenuService::class.java)
@@ -156,8 +169,11 @@ class OverlayMenuService : Service() {
     private lateinit var wm: WindowManager
     private lateinit var lp: WindowManager.LayoutParams
     private lateinit var prefs: SharedPreferences
-    private var root: LinearLayout? = null
-    private var status: TextView? = null
+    private var rootView: LinearLayout? = null
+    private var gatePanel: LinearLayout? = null
+    private var featurePanel: LinearLayout? = null
+    private var injectBtn: Button? = null
+    private var statusView: TextView? = null
     private val ui = Handler(Looper.getMainLooper())
 
     private val ticker = object : Runnable {
@@ -193,7 +209,7 @@ class OverlayMenuService : Service() {
 
     override fun onDestroy() {
         ui.removeCallbacksAndMessages(null)
-        val r = root
+        val r = rootView
         if (r != null) {
             try {
                 wm.removeView(r)
@@ -201,7 +217,7 @@ class OverlayMenuService : Service() {
                 Log.e(TAG, "removeView failed: " + t)
             }
         }
-        root = null
+        rootView = null
         super.onDestroy()
     }
 
@@ -247,9 +263,8 @@ class OverlayMenuService : Service() {
             setStroke((dm.density * 1.5f).toInt(), Color.parseColor("#66FF3B30"))
         }
 
-        // Header row: title (drag handle) + collapse chevron.
-        // Collapsing only hides the body, so the title stays grabbable and the
-        // menu is always recoverable - never hide the root view.
+        // Header: drag handle + collapse. Collapsing hides only the body, so the
+        // menu can never become unrecoverable.
         val headerRow = LinearLayout(this)
         headerRow.orientation = LinearLayout.HORIZONTAL
         headerRow.gravity = Gravity.CENTER_VERTICAL
@@ -281,29 +296,66 @@ class OverlayMenuService : Service() {
         box.addView(headerRow)
         box.addView(body)
 
-        addToggle(body, "Aim assist")  { on -> ModBridge.setAimEnabled(on) }
-        addToggle(body, "Antiban")     { on -> ModBridge.setAntibanEnabled(on) }
-        addToggle(body, "Lobby bypass"){ on -> ModBridge.setLobbyBypassEnabled(on) }
-        addToggle(body, "Game bypass") { on -> ModBridge.setGameBypassEnabled(on) }
+        // ---- gate: INJECT BYPASS -------------------------------------------
+        val gate = LinearLayout(this)
+        gate.orientation = LinearLayout.VERTICAL
 
+        val hint = TextView(this)
+        hint.text = "Not injected. Press inject to enable the bypasses and unlock features."
+        hint.setTextColor(Color.parseColor("#9A9A9E"))
+        hint.textSize = 11f
+        hint.setPadding(0, 0, 0, (dm.density * 8f).toInt())
+        gate.addView(hint)
+
+        val btn = Button(this)
+        btn.text = "INJECT BYPASS"
+        btn.textSize = 13f
+        btn.setOnClickListener { doInject() }
+        gate.addView(btn, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        injectBtn = btn
+
+        body.addView(gate)
+        gatePanel = gate
+
+        // ---- features -------------------------------------------------------
+        val features = LinearLayout(this)
+        features.orientation = LinearLayout.VERTICAL
+        features.visibility = View.GONE
+
+        val banner = TextView(this)
+        banner.text = "INJECTED"
+        banner.setTextColor(Color.parseColor("#34C759"))
+        banner.textSize = 11f
+        banner.setTypeface(Typeface.DEFAULT_BOLD)
+        banner.setPadding(0, 0, 0, (dm.density * 6f).toInt())
+        features.addView(banner)
+
+        addToggle(features, "Silent aim", "silent_aim") { on -> ModBridge.setSilentAimEnabled(on) }
+
+        body.addView(features)
+        featurePanel = features
+
+        // ---- status ---------------------------------------------------------
         val st = TextView(this)
         st.setTextColor(Color.parseColor("#8A8A8E"))
         st.textSize = 11f
         st.setPadding(0, (dm.density * 8f).toInt(), 0, (dm.density * 4f).toInt())
-        st.text = "mod=idle"
+        st.text = "…"
         body.addView(st)
-        status = st
+        statusView = st
 
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
-
         val close = Button(this)
         close.text = "Close"
         close.textSize = 11f
         close.setOnClickListener { stopSelf() }
-
         row.addView(close, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
         body.addView(row)
+
+        // Restore the gate state from the last session.
+        applyInjected(prefs.getBoolean(K_INJECTED, false), announce = false)
 
         val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -342,7 +394,7 @@ class OverlayMenuService : Service() {
                     MotionEvent.ACTION_MOVE -> {
                         lp.x = startX + (e.rawX - downX).toInt()
                         lp.y = startY + (e.rawY - downY).toInt()
-                        val r = root
+                        val r = rootView
                         if (r != null) {
                             try {
                                 wm.updateViewLayout(r, lp)
@@ -358,12 +410,74 @@ class OverlayMenuService : Service() {
         })
 
         wm.addView(box, lp)
-        root = box
+        rootView = box
         refreshStatus()
         Log.i(TAG, "menu displayed")
     }
 
-    private fun addToggle(parent: LinearLayout, label: String, apply: (Boolean) -> Unit) {
+    /**
+     * What "inject" does here, precisely:
+     *   1. switches both bypass flags on (they are what the hooks act on),
+     *   2. asks the library to install hooks in THIS process via Injector,
+     *   3. reports honestly whether that worked.
+     *
+     * In the launcher process libil2cpp.so does not exist, so step 3 will say
+     * "not hooked" and point at deploy_ff.ps1. That is not a failure of this
+     * screen - it is the truth about where the hooks have to live.
+     */
+    private fun doInject() {
+        val btn = injectBtn ?: return
+        btn.isEnabled = false
+        btn.text = "INJECTING..."
+
+        Thread {
+            var loaded = false
+            var base = "0x0"
+            try {
+                loaded = ModBridge.isModLoaded()
+            } catch (t: Throwable) {
+                Log.e(TAG, "isModLoaded failed: " + t)
+            }
+
+            try {
+                ModBridge.setLobbyBypassEnabled(true)
+                ModBridge.setGameBypassEnabled(true)
+            } catch (t: Throwable) {
+                Log.e(TAG, "enabling bypasses failed: " + t)
+            }
+
+            if (!loaded) {
+                try {
+                    Injector.initHooks()
+                    base = try { Injector.getIl2cppBase() } catch (t: Throwable) { "0x0" }
+                    loaded = ModBridge.isModLoaded()
+                } catch (t: Throwable) {
+                    Log.e(TAG, "initHooks failed: " + t)
+                }
+            }
+
+            Log.i(TAG, "inject result: loaded=" + loaded + " il2cpp=" + base)
+
+            prefs.edit().putBoolean(K_INJECTED, true).apply()
+            ui.post { applyInjected(true, announce = true) }
+        }.start()
+    }
+
+    private fun applyInjected(injected: Boolean, announce: Boolean) {
+        val g = gatePanel
+        val f = featurePanel
+        if (g != null) g.visibility = if (injected) View.GONE else View.VISIBLE
+        if (f != null) f.visibility = if (injected) View.VISIBLE else View.GONE
+        val btn = injectBtn
+        if (btn != null) {
+            btn.isEnabled = true
+            btn.text = "INJECT BYPASS"
+        }
+        if (announce) Log.i(TAG, "features unlocked")
+        refreshStatus()
+    }
+
+    private fun addToggle(parent: LinearLayout, label: String, key: String, apply: (Boolean) -> Unit) {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
         row.gravity = Gravity.CENTER_VERTICAL
@@ -373,7 +487,6 @@ class OverlayMenuService : Service() {
         tv.setTextColor(Color.parseColor("#EDEDED"))
         tv.textSize = 13f
 
-        val key = "sw_" + label.lowercase().replace(" ", "_")
         val sw = Switch(this)
         sw.isChecked = prefs.getBoolean(key, false)
         sw.setOnCheckedChangeListener { _, checked ->
@@ -381,7 +494,7 @@ class OverlayMenuService : Service() {
             try {
                 apply(checked)
             } catch (t: Throwable) {
-                Log.e(TAG, "applying $label failed: " + t)
+                Log.e(TAG, "applying " + label + " failed: " + t)
             }
             refreshStatus()
         }
@@ -392,27 +505,29 @@ class OverlayMenuService : Service() {
     }
 
     private fun refreshStatus() {
-        val t = status ?: return
+        val t = statusView ?: return
         var loaded = false
-        var lobby = false
-        var game = false
+        var silent = false
         try {
             loaded = ModBridge.isModLoaded()
-            lobby = ModBridge.isLobbyBypassActive()
-            game = ModBridge.isGameBypassActive()
+            silent = ModBridge.isSilentAimActive()
         } catch (th: Throwable) {
+            t.setTextColor(Color.parseColor("#FF9F0A"))
             t.text = "native library not loaded"
             return
         }
-        val l = if (loaded) "loaded" else "idle"
-        val lo = if (lobby) "OK" else "-"
-        val ga = if (game) "OK" else "-"
-        t.text = "mod=" + l + "   lobby=" + lo + "   game=" + ga
+        if (!loaded) {
+            t.setTextColor(Color.parseColor("#FF453A"))
+            t.text = "hooks NOT installed\nrun deploy_ff.ps1 (root) to load the module inside Free Fire"
+        } else {
+            t.setTextColor(Color.parseColor("#34C759"))
+            t.text = if (silent) "hooks live - silent aim firing" else "hooks live - silent aim idle"
+        }
     }
 }
 '@
 
-[System.IO.File]::WriteAllText((Join-Path $SrcDir "OverlayMenuService.kt"), $serviceKt, (New-Object System.Text.UTF8Encoding($false)))
+Write-Kt (Join-Path $SrcDir "OverlayMenuService.kt") $serviceKt
 Ok (Join-Path $SrcDir "OverlayMenuService.kt")
 
 # ---------------------------------------------------------------------------
@@ -434,11 +549,10 @@ import android.provider.Settings
 import android.util.Log
 
 /**
- * Starts OverlayMenuService as soon as the app process comes up, so nothing has
- * to be added to MainActivity.kt.
+ * Starts OverlayMenuService when the app process comes up, so MainActivity.kt
+ * needs no edits.
  *
- * Deliberately does nothing when SYSTEM_ALERT_WINDOW has not been granted; grant
- * it once with:
+ * Does nothing when SYSTEM_ALERT_WINDOW has not been granted. Grant it once:
  *
  *     adb shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow
  */
@@ -487,13 +601,86 @@ class OverlayAutoStart : ContentProvider() {
 }
 '@
 
-[System.IO.File]::WriteAllText((Join-Path $SrcDir "OverlayAutoStart.kt"), $autoKt, (New-Object System.Text.UTF8Encoding($false)))
+Write-Kt (Join-Path $SrcDir "OverlayAutoStart.kt") $autoKt
 Ok (Join-Path $SrcDir "OverlayAutoStart.kt")
 
 # ---------------------------------------------------------------------------
-# 3. AndroidManifest.xml
+# 3. Injector.kt
 # ---------------------------------------------------------------------------
-Step 3 "Patching AndroidManifest.xml"
+Step 3 "Writing Injector.kt"
+
+$injectorKt = @'
+package com.ffmodroot
+
+/**
+ * Matches the JNI symbols libant_aincrad.so already exports:
+ *
+ *     Java_com_ffmodroot_Injector_initHooks
+ *     Java_com_ffmodroot_Injector_getIl2cppBase
+ *
+ * Kotlin on purpose - a Dumper.java / Injector.java here is exactly what broke
+ * the build before (duplicate class + BOM).
+ *
+ * In the launcher process libil2cpp.so is never mapped, so initHooks() returns
+ * false and logs "libil2cpp.so not found". That is expected; the real injection
+ * happens in the game process via deploy_ff.ps1.
+ */
+object Injector {
+    init {
+        System.loadLibrary("ant_aincrad")
+    }
+
+    external fun initHooks(): Boolean
+    external fun getIl2cppBase(): String
+}
+'@
+
+Write-Kt (Join-Path $SrcDir "Injector.kt") $injectorKt
+Ok (Join-Path $SrcDir "Injector.kt")
+
+# ---------------------------------------------------------------------------
+# 4. append the new externals to ModBridge.kt
+# ---------------------------------------------------------------------------
+Step 4 "Adding silent-aim externals to ModBridge.kt"
+
+$mb = [System.IO.File]::ReadAllText($ModBridgeKt)
+$changed = $false
+
+foreach ($pair in @(
+        @("setSilentAimEnabled", "    external fun setSilentAimEnabled(enabled: Boolean)"),
+        @("isSilentAimActive",   "    external fun isSilentAimActive(): Boolean")
+    )) {
+    $name = $pair[0]
+    $decl = $pair[1]
+    if ($mb -match ("external\s+fun\s+" + [regex]::Escape($name) + "\s*\(")) {
+        Ok "$name already declared"
+        continue
+    }
+    $mb = $mb -replace '(?m)^(\s*external\s+fun\s+isGameBypassActive\s*\([^)]*\)\s*:\s*Boolean\s*)$',
+                       ("`$1`r`n" + $decl)
+    $changed = $true
+    Ok "added $name"
+}
+
+if ($changed) {
+    if ($mb -notmatch 'external\s+fun\s+setSilentAimEnabled\s*\(' -or
+        $mb -notmatch 'external\s+fun\s+isSilentAimActive\s*\(') {
+        Bad "could not insert both externals - ModBridge.kt shape is not what I expected"
+        Bad "open $ModBridgeKt and add these two lines by hand, inside the object:"
+        Write-Host "      external fun setSilentAimEnabled(enabled: Boolean)" -ForegroundColor White
+        Write-Host "      external fun isSilentAimActive(): Boolean" -ForegroundColor White
+        exit 1
+    }
+    [System.IO.File]::WriteAllText($ModBridgeKt, $mb, $Utf8NoBom)
+    Ok "ModBridge.kt updated (UTF-8, no BOM)"
+} else {
+    Ok "ModBridge.kt already complete"
+}
+
+# ---------------------------------------------------------------------------
+# 5. AndroidManifest.xml
+# ---------------------------------------------------------------------------
+Step 5 "Patching AndroidManifest.xml"
 
 $NS = "http://schemas.android.com/apk/res/android"
 [xml]$doc = Get-Content -Raw $Manifest
@@ -524,7 +711,6 @@ foreach ($p in $wanted) {
 $appNode = $manifestNode.SelectSingleNode("application")
 if (-not $appNode) { Bad "no <application> element in the manifest"; exit 1 }
 
-# --- service ---
 $svc = $appNode.SelectSingleNode("service[@*[local-name()='name']='.OverlayMenuService']")
 if (-not $svc) {
     $svc = $doc.CreateElement("service")
@@ -538,7 +724,7 @@ if (-not $svc) {
         [void]$svc.AppendChild($prop)
         Ok "service declared with foregroundServiceType=specialUse (compileSdk $compileSdk)"
     } else {
-        Warn "compileSdk < 34 - omitting foregroundServiceType (not needed below API 34)"
+        Warn "compileSdk < 34 - omitting foregroundServiceType"
     }
     [void]$appNode.AppendChild($svc)
     Ok "added <service .OverlayMenuService>"
@@ -546,7 +732,6 @@ if (-not $svc) {
     Ok "<service .OverlayMenuService> already present"
 }
 
-# --- provider ---
 $prov = $appNode.SelectSingleNode("provider[@*[local-name()='name']='.OverlayAutoStart']")
 if (-not $prov) {
     $prov = $doc.CreateElement("provider")
@@ -563,16 +748,16 @@ if (-not $prov) {
 $settings = New-Object System.Xml.XmlWriterSettings
 $settings.Indent = $true
 $settings.IndentChars = "    "
-$settings.Encoding = New-Object System.Text.UTF8Encoding($false)
+$settings.Encoding = $Utf8NoBom
 $writer = [System.Xml.XmlWriter]::Create($Manifest, $settings)
 try { $doc.Save($writer) } finally { $writer.Close() }
 Ok "manifest saved (UTF-8, no BOM)"
 
 # ---------------------------------------------------------------------------
-# 4. optional: grant the overlay permission over adb
+# 6. overlay permission
 # ---------------------------------------------------------------------------
 if ($Grant) {
-    Step 4 "Granting SYSTEM_ALERT_WINDOW over adb"
+    Step 6 "Granting SYSTEM_ALERT_WINDOW over adb"
     $devices = (& adb devices) -join "`n"
     if ($devices -notmatch [regex]::Escape($Serial)) {
         Warn "$Serial not connected - running adb connect"
@@ -583,20 +768,19 @@ if ($Grant) {
     Write-Host "   appops -> $state"
     if ($state -match "allow") { Ok "overlay permission granted" }
     else {
-        Bad "grant did not take. Try the rooted fallback:"
+        Bad "grant did not take. Rooted fallback:"
         Write-Host "      adb -s $Serial shell su -c 'appops set $Package SYSTEM_ALERT_WINDOW allow'" -ForegroundColor White
     }
 } else {
-    Step 4 "Overlay permission"
-    Warn "Not granted yet. Run this once (rooted BlueStacks):"
+    Step 6 "Overlay permission"
+    Warn "not granted yet - run once:"
     Write-Host "      adb -s $Serial shell appops set $Package SYSTEM_ALERT_WINDOW allow" -ForegroundColor White
-    Write-Host "   or re-run this script with -Grant" -ForegroundColor White
 }
 
 Write-Host ""
-Ok "Files written. Now rebuild and reinstall:"
+Ok "Files written. Rebuild and reinstall:"
 Write-Host "      powershell -ExecutionPolicy Bypass -File .\fix_ffmodroot.ps1" -ForegroundColor White
 Write-Host ""
-Write-Host "Then open ANT AINCRAD. The menu appears ~1.5 s after the app starts and" -ForegroundColor Yellow
-Write-Host "stays on top when Free Fire is in front." -ForegroundColor Yellow
-Write-Host "Log tag: ANT-Aincrad-Overlay" -ForegroundColor Yellow
+Write-Host "You also need to rebuild the native module first, because silent aim is new" -ForegroundColor Yellow
+Write-Host "native code:" -ForegroundColor Yellow
+Write-Host "      powershell -ExecutionPolicy Bypass -File .\build_native.ps1" -ForegroundColor White

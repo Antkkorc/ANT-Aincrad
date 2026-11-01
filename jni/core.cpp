@@ -64,6 +64,7 @@
 /* ------------------------------------------------------------------------- */
 struct FeatureState {
     std::atomic<bool> aim{false};
+    std::atomic<bool> silentAim{false};
     std::atomic<bool> antiban{false};
     std::atomic<bool> lobbyBypass{false};
     std::atomic<bool> gameBypass{false};
@@ -71,9 +72,19 @@ struct FeatureState {
     std::atomic<bool> modLoaded{false};
     std::atomic<bool> lobbyBypassActive{false};
     std::atomic<bool> gameBypassActive{false};
+    std::atomic<bool> silentActive{false};
 };
 
 static FeatureState g_state;
+
+/*
+ * Tunable without recompiling: add "aim_height=<metres>" to
+ * /data/local/tmp/ant_aincrad.cfg. The player transform we can resolve is the
+ * root, which normally sits at the feet, so 0.0 aims at the ground. Until a
+ * head/bone transform is validated against a live build, this is the knob that
+ * decides whether shots land on the chest or the ankles.
+ */
+static float g_aim_height = 0.0f;
 
 static const char* kConfigPath = "/data/local/tmp/ant_aincrad.cfg";
 
@@ -84,6 +95,8 @@ static void write_config() {
     FILE* f = fopen(kConfigPath, "w");
     if (!f) return;
     fprintf(f, "aim=%d\n",         g_state.aim.load()         ? 1 : 0);
+    fprintf(f, "silent_aim=%d\n",  g_state.silentAim.load()   ? 1 : 0);
+    fprintf(f, "aim_height=%.2f\n", (double)g_aim_height);
     fprintf(f, "antiban=%d\n",     g_state.antiban.load()     ? 1 : 0);
     fprintf(f, "lobby_bypass=%d\n",g_state.lobbyBypass.load() ? 1 : 0);
     fprintf(f, "game_bypass=%d\n", g_state.gameBypass.load()  ? 1 : 0);
@@ -97,7 +110,10 @@ static void read_config() {
     char line[64];
     while (fgets(line, sizeof(line), f)) {
         int v = 0;
-        if (sscanf(line, "aim=%d", &v) == 1)              g_state.aim.store(v != 0);
+        float f = 0.0f;
+        if (sscanf(line, "silent_aim=%d", &v) == 1)       g_state.silentAim.store(v != 0);
+        else if (sscanf(line, "aim_height=%f", &f) == 1)  g_aim_height = f;
+        else if (sscanf(line, "aim=%d", &v) == 1)          g_state.aim.store(v != 0);
         else if (sscanf(line, "antiban=%d", &v) == 1)     g_state.antiban.store(v != 0);
         else if (sscanf(line, "lobby_bypass=%d", &v) == 1) g_state.lobbyBypass.store(v != 0);
         else if (sscanf(line, "game_bypass=%d", &v) == 1)  g_state.gameBypass.store(v != 0);
@@ -218,45 +234,27 @@ static Quat look_at(const Vec3& eye, const Vec3& target) {
 }
 
 /* ------------------------------------------------------------------------- */
-/*  Reconstructed aimbot                                                     */
+/*  Target selection                                                        */
 /* ------------------------------------------------------------------------- */
-static std::atomic<int> g_aim_ticks{0};
-static Quat g_last_rot{0, 0, 0, 1};
+static std::atomic<int>   g_aim_ticks{0};
+static std::atomic<unsigned> g_silent_hits{0};
 
-static void* hooked_set_aim(void* self, float qx, float qy, float qz, float qw) {
-    SetAimFn orig = reinterpret_cast<SetAimFn>(g_orig_setaim);
-    if (!orig) return nullptr;
+static bool find_target(void* self, Vec3* out_eye, Vec3* out_aim) {
+    if (!self || !g_fn.current_match || !g_fn.player_by_idx) return false;
 
-    if (!g_state.aim.load(std::memory_order_acquire))
-        return orig(self, qx, qy, qz, qw);
-
-    /* Only steer while firing or aiming down sights, like the original. */
-    bool firing  = g_fn.is_firing  ? g_fn.is_firing(self)  : false;
-    bool sighting = g_fn.is_sighting ? g_fn.is_sighting(self) : false;
-    if (!firing && !sighting)
-        return orig(self, qx, qy, qz, qw);
-
-    /* Re-arm the smoothing every few ticks so it never fully locks up. */
-    int ticks = g_aim_ticks.load();
-    if (ticks >= 4) {
-        g_aim_ticks.store(0);
-        g_last_rot = Quat{qx, qy, qz, qw};
-        return orig(self, qx, qy, qz, qw);
-    }
-
-    void* match = g_fn.current_match ? g_fn.current_match() : nullptr;
-    if (!match || !g_fn.player_by_idx || !self)
-        return orig(self, qx, qy, qz, qw);
+    void* match = g_fn.current_match();
+    if (!match) return false;
 
     Vec3 eye{};
     if (g_fn.get_position) {
-        void* tr = *reinterpret_cast<void**>(reinterpret_cast<char*>(self) + FFV::PLAYER_TRANSFORM_FIELD);
+        void* tr = *reinterpret_cast<void**>(
+            reinterpret_cast<char*>(self) + FFV::PLAYER_TRANSFORM_FIELD);
         if (tr) eye = *reinterpret_cast<Vec3*>(g_fn.get_position(tr));
     }
 
-    void*  target = nullptr;
-    float  best   = FFV::MAX_TARGET_DISTANCE;
-    Vec3   target_pos{};
+    void* best_target = nullptr;
+    float best        = FFV::MAX_TARGET_DISTANCE;
+    Vec3  aim{};
 
     for (int i = 0; i < FFV::MAX_PLAYER_SCAN; ++i) {
         void* p = g_fn.player_by_idx(match, i);
@@ -264,33 +262,86 @@ static void* hooked_set_aim(void* self, float qx, float qy, float qz, float qw) 
         if (g_fn.is_local_player && g_fn.is_local_player(p)) continue;
         if (g_fn.is_teammate     && g_fn.is_teammate(p))     continue;
         if (g_fn.is_dieing      && g_fn.is_dieing(p))       continue;
-        if (!g_fn.is_visible    || !g_fn.is_visible(p))      continue;
-        if (g_fn.cur_hp         && g_fn.cur_hp(p) < 1)       continue;
         if (g_fn.is_crouching   && g_fn.is_crouching(p))     continue;
         if (g_fn.is_sky_diving  && g_fn.is_sky_diving(p))    continue;
         if (g_fn.is_sky_dashing && g_fn.is_sky_dashing(p))   continue;
+        if (!g_fn.is_visible    || !g_fn.is_visible(p))      continue;
+        if (g_fn.cur_hp         && g_fn.cur_hp(p) < 1)       continue;
 
         Vec3 pos{};
-        void* tr = *reinterpret_cast<void**>(reinterpret_cast<char*>(p) + FFV::PLAYER_TRANSFORM_FIELD);
+        void* tr = *reinterpret_cast<void**>(
+            reinterpret_cast<char*>(p) + FFV::PLAYER_TRANSFORM_FIELD);
         if (tr && g_fn.get_position) pos = *reinterpret_cast<Vec3*>(g_fn.get_position(tr));
+        pos.y += g_aim_height;
 
         float d = dist3(eye, pos);
-        if (d < best) { best = d; target = p; target_pos = pos; }
+        if (d < best) { best = d; best_target = p; aim = pos; }
     }
 
-    if (!target)
+    if (!best_target) return false;
+    *out_eye = eye;
+    *out_aim = aim;
+    return true;
+}
+
+/* ------------------------------------------------------------------------- */
+/*  The hook                                                                */
+/* ------------------------------------------------------------------------- */
+static bool shot_in_progress(void* self) {
+    bool firing   = g_fn.is_firing   ? g_fn.is_firing(self)   : false;
+    bool sighting = g_fn.is_sighting ? g_fn.is_sighting(self) : false;
+    return firing || sighting;
+}
+
+static void* hooked_set_aim(void* self, float qx, float qy, float qz, float qw) {
+    SetAimFn orig = reinterpret_cast<SetAimFn>(g_orig_setaim);
+    if (!orig) return nullptr;
+
+    const bool silent = g_state.silentAim.load(std::memory_order_acquire);
+    const bool assist = g_state.aim.load(std::memory_order_acquire);
+    if (!silent && !assist)
         return orig(self, qx, qy, qz, qw);
 
-    Quat want = look_at(eye, target_pos);
-    ticks = g_aim_ticks.load() + 1;
+    /* Only rewrite the rotation while a shot is actually being set up. */
+    if (!shot_in_progress(self))
+        return orig(self, qx, qy, qz, qw);
+
+    Vec3 eye{}, aim{};
+    if (!find_target(self, &eye, &aim))
+        return orig(self, qx, qy, qz, qw);
+
+    Quat want = look_at(eye, aim);
+
+    /* ---- silent aim -----------------------------------------------------
+     * Replace the rotation handed to SetAimRotation with the one that points
+     * at the target. No smoothing, no accumulation across ticks: the value is
+     * exact and immediate, so the shot goes where the target is. Whether the
+     * local camera follows is up to the game - SetAimRotation is the
+     * shot-direction path in this build, which is why the original binary
+     * hooked it here rather than at the camera.
+     */
+    if (silent) {
+        g_state.silentActive.store(true);
+        unsigned n = g_silent_hits.fetch_add(1);
+        if (n < 3) {
+            LOGI("silent aim: shot rotation rewritten (dist %.1f)", (double)dist3(eye, aim));
+        }
+        return orig(self, want.x, want.y, want.z, want.w);
+    }
+
+    /* ---- aim assist (smoothed) ----------------------------------------- */
+    int ticks = g_aim_ticks.load();
+    if (ticks >= 4) {
+        g_aim_ticks.store(0);
+        return orig(self, qx, qy, qz, qw);
+    }
+    ticks += 1;
     g_aim_ticks.store(ticks);
 
     float t = (float)ticks / FFV::AIM_SMOOTHING;
     if (t > 1.0f) t = 1.0f;
 
     Quat out = q_slerp(Quat{qx, qy, qz, qw}, want, t);
-    g_last_rot = out;
-
     return orig(self, out.x, out.y, out.z, out.w);
 }
 
@@ -557,6 +608,17 @@ Java_com_ffmodroot_ModBridge_isLobbyBypassActive(JNIEnv*, jobject) {
 JNIEXPORT jboolean JNICALL
 Java_com_ffmodroot_ModBridge_isGameBypassActive(JNIEnv*, jobject) {
     return g_state.gameBypassActive.load() ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_ffmodroot_ModBridge_setSilentAimEnabled(JNIEnv*, jobject, jboolean on) {
+    g_state.silentAim.store(on == JNI_TRUE);
+    write_config();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_ffmodroot_ModBridge_isSilentAimActive(JNIEnv*, jobject) {
+    return g_state.silentActive.load() ? JNI_TRUE : JNI_FALSE;
 }
 
 /* ------------------------------------------------------------------------- */

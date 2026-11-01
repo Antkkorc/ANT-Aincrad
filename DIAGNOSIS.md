@@ -354,3 +354,29 @@ It needs `SYSTEM_ALERT_WINDOW`, grantable in one command on rooted BlueStacks:
 ```
 adb shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow
 ```
+
+---
+
+## 11. Silent aim vs aim assist, and the inject gate
+
+`SetAimRotation` (`0x11AD820`) is the **shot direction** path in this build, not
+the camera, which is why hooking it is the right mechanism for silent aim.
+
+`core.cpp` now separates the two modes:
+
+| mode | behaviour |
+|---|---|
+| `silent_aim=1` | exact rotation toward the target on the shot call, no smoothing, no cross-tick accumulation |
+| `aim=1` | original behaviour: slerp with `AIM_SMOOTHING` over ≤ 4 ticks |
+
+Both are guarded by `is_firing() || is_sighting()` so the rotation is only
+rewritten while a shot is being set up.
+
+`aim_height=<metres>` in `/data/local/tmp/ant_aincrad.cfg` offsets the aim point
+vertically, because only the player **root** transform is resolvable right now —
+shots would otherwise land at the feet. It is re-read live by the 500 ms poller.
+
+The overlay is gated behind `INJECT BYPASS`; see `OVERLAY.md`. `SILENT_AIM.md`
+lists exactly what is verified (compilation, exports, hook maths) and what is not
+(camera follow, aim point height, `IsFiring` timing) so the user can test rather
+than trust.
