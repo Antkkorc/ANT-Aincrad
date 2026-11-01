@@ -48,6 +48,7 @@ function Bad($m)  { Write-Host "   [FAIL] $m" -ForegroundColor Red }
 # 0. sanity
 # ---------------------------------------------------------------------------
 Step 0 "Checking project layout"
+if ([string]::IsNullOrWhiteSpace($ProjectRoot)) { $ProjectRoot = (Get-Location).Path }
 if (-not (Test-Path $ProjectRoot)) {
     # Fall back to the current directory if it looks like the Android project.
     if (Test-Path (Join-Path (Get-Location) "gradlew.bat")) {
@@ -142,11 +143,16 @@ if ($script:failed) { exit 1 }
 # ---------------------------------------------------------------------------
 Step 5 "Building the APK (clean, no stale artefacts)"
 Push-Location $ProjectRoot
+$prevEap = $ErrorActionPreference
+# Gradle writes errors to stderr; with Stop, PowerShell would raise a
+# terminating NativeCommandError before we can inspect $LASTEXITCODE.
+$ErrorActionPreference = "Continue"
 try {
     & .\gradlew.bat clean 2>&1 | Out-Host
     & .\gradlew.bat assembleDebug 2>&1 | Out-Host
     $buildExit = $LASTEXITCODE
 } finally {
+    $ErrorActionPreference = $prevEap
     Pop-Location
 }
 
@@ -171,6 +177,9 @@ if ($BuildOnly) { Write-Host ""; Ok "BuildOnly requested - stopping here."; exit
 # 6. install on BlueStacks
 # ---------------------------------------------------------------------------
 Step 6 "Deploying to $Serial"
+$prevEap2 = $ErrorActionPreference
+$ErrorActionPreference = "Continue"
+try {
 $devices = (& adb devices) -join "`n"
 if ($devices -notmatch [regex]::Escape($Serial)) {
     Warn "$Serial not listed - trying adb connect"
@@ -205,3 +214,6 @@ Write-Host ""
 Write-Host "If you see 'libil2cpp.so not found' that is EXPECTED in the launcher" -ForegroundColor Yellow
 Write-Host "process. It means the toggles have nothing to steer - run deploy_ff.ps1" -ForegroundColor Yellow
 Write-Host "to load the module inside Free Fire instead." -ForegroundColor Yellow
+} finally {
+    $ErrorActionPreference = $prevEap2
+}

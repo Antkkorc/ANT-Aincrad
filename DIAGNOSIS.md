@@ -241,3 +241,22 @@ The script then verifies the result with the NDK's `llvm-nm` and fails if any of
 the 11 `Java_com_ffmodroot_*` entry points or `_Z16ant_aincrad_initv` is
 missing — i.e. it refuses to hand you a `.so` that would crash with
 `UnsatisfiedLinkError` again.
+
+---
+
+## 7. Troubleshooting build_native.ps1
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_native.ps1
+```
+
+| symptom | cause | fix |
+|---|---|---|
+| `Cannot bind argument to parameter 'Path' because it is an empty string` | `$RepoRoot = $PSScriptRoot` was **empty** in the param default under `powershell -File`, so the first `Join-Path` in the compile step died | fixed: the default is `""` now and the repo is resolved from `$PSScriptRoot`, then `$MyInvocation.MyCommand.Path`, then the current directory — whichever contains `jni\` |
+| `ndk-build ... APP_PLATFORM ... Aborting` | legacy `Application.mk` flow, rejected by modern NDKs | fixed: clang is driven directly |
+| `no aarch64 clang++ wrapper` / compiler not executable | some NDKs ship an extensionless POSIX shell script beside the `.cmd` wrapper; Windows cannot run it | fixed: `.cmd` is preferred, `.exe` next, extensionless only on non-Windows; plain `clang++.exe` is the fallback |
+| symlink/`Out-String` noise, script dies mid-compile | clang writes warnings to **stderr** and `$ErrorActionPreference = "Stop"` turns that into a terminating error | fixed: relaxed to `Continue` around the native calls, exit code checked explicitly |
+| `[FAIL] missing symbols: ...` | the `.so` was built from a stale `core.cpp` | re-run `git pull`, then rebuild |
+
+The script refuses to copy a `.so` that is missing any of the 12 entry points, so
+a runtime `UnsatisfiedLinkError` cannot slip through again.
