@@ -1,0 +1,81 @@
+# The floating menu
+
+## Why it did not exist
+
+Nothing in this project ever drew anything over Free Fire. Evidence:
+
+```
+$ strings -a libant_aincrad.so | grep -iE "imgui|egl|overlay|window|menu|button|motion"
+(no output - 0 matches)
+
+$ strings -a libant_aincrad.so | grep -E "^lib.*\.so$"
+libc.so libm.so libshadowhook.so liblog.so libandroid.so libc++_shared.so libdl.so
+```
+
+No `libEGL`, no `libGLESv2`, no ImGui, no widget code. The library hooks two
+things (`SetAimRotation`, `sendto`/`send`) and writes flags to
+`/data/local/tmp/ant_aincrad.cfg`.
+
+And the APK's dex contains exactly:
+
+```
+MainActivity, MainActivityKt, ComposableSingletons, ModBridge, RootInjector, Screen, ui.theme.*
+```
+
+No `*Service`, so no window could ever be added. The toggles you were tapping
+are the launcher's Compose screens, which live *inside* the app.
+
+(Aincrad Client's menu is a separate ImGui renderer injected into the game with
+an `eglSwapBuffers` hook. That is a different piece of software.)
+
+## What `add_floating_menu.ps1` adds
+
+| file | role |
+|---|---|
+| `OverlayMenuService.kt` | foreground Service that adds a `TYPE_APPLICATION_OVERLAY` window: draggable title, collapse chevron, switches for Aim assist / Antiban / Lobby bypass / Game bypass, live `mod= …  lobby= …  game= …` status line, Close button |
+| `OverlayAutoStart.kt` | `ContentProvider` that starts the service when the app process comes up, so `MainActivity.kt` does not have to be edited |
+| `AndroidManifest.xml` | `SYSTEM_ALERT_WINDOW`, `FOREGROUND_SERVICE`, `FOREGROUND_SERVICE_SPECIAL_USE`, `POST_NOTIFICATIONS`, plus the `<service>` and `<provider>` |
+
+The switches call the **same** `ModBridge.setXxxEnabled()` functions the Compose
+UI calls, so the native module writes the same config file and the in-game copy
+picks it up within 500 ms.
+
+## Overlay permission
+
+Android refuses to draw over another app without `SYSTEM_ALERT_WINDOW`. On a
+rooted BlueStacks the dependable route is one adb command:
+
+```powershell
+adb -s 127.0.0.1:5555 shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow
+adb -s 127.0.0.1:5555 shell appops get com.ffmodroot SYSTEM_ALERT_WINDOW
+```
+
+Expect `SYSTEM_ALERT_WINDOW: allow`. Fallbacks, in order:
+
+1. `adb -s 127.0.0.1:5555 shell su -c 'appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow'`
+2. In the emulator: Settings → Apps → ANT AINCRAD → *Display over other apps* → allow
+3. `add_floating_menu.ps1 -Grant` does step 1 and reports the resulting state
+
+## How to tell it is working
+
+```
+adb -s 127.0.0.1:5555 logcat -s ANT-Aincrad-Overlay
+```
+
+| line | meaning |
+|---|---|
+| `OverlayAutoStart: overlayAllowed=true` | permission fine, service about to start |
+| `menu displayed` | the window is on screen |
+| `overlayAllowed=false` + the `appops` hint | permission missing — run the adb command |
+
+## Honest limits
+
+* This is an **app window above the game**, not a renderer inside it. Some games
+  draw in a surface that hides overlays; Free Fire normally does not.
+* It cannot show in-game values (enemy positions, HP) — the module exposes no
+  such data across processes yet. Toggles and status only.
+* A true in-game ImGui menu means vendoring ImGui, hooking `eglSwapBuffers`, and
+  feeding it touch events from the game process. That is a separate project; ask
+  if you want it and I will scope it.
+* Toggling a switch is only half the job — the hooks still have to be loaded
+  inside Free Fire with `deploy_ff.ps1`.

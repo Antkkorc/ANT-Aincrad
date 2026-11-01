@@ -334,3 +334,23 @@ Step 7 also distinguishes the three possible native states now:
 No native line at all is **normal** on a fresh launch: `ModBridge` is a Kotlin
 `object`, so `System.loadLibrary()` only runs the first time the UI touches it.
 Touch a toggle, then re-check logcat.
+
+---
+
+## 10. The floating menu never existed
+
+See `OVERLAY.md`. Summary of the evidence: `libant_aincrad.so` has **zero**
+matches for `imgui|egl|overlay|window|menu|button|motion`, does not link `libEGL`
+or `libGLESv2`, and the APK dex contains no `*Service` class at all. Nothing in
+this repository could ever have drawn over Free Fly.
+
+`add_floating_menu.ps1` adds it: `OverlayMenuService.kt` (a
+`TYPE_APPLICATION_OVERLAY` window with the four toggles), `OverlayAutoStart.kt` (a
+provider so `MainActivity.kt` needs no edits), and the manifest entries, including
+`foregroundServiceType="specialUse"` when `compileSdk >= 34`.
+
+It needs `SYSTEM_ALERT_WINDOW`, grantable in one command on rooted BlueStacks:
+
+```
+adb shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow
+```
