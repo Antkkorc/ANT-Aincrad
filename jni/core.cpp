@@ -42,8 +42,11 @@
 #include <math.h>
 #include <atomic>
 #include <sys/stat.h>
+#include <time.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "shadowhook.h"
 #include "offsets.h"
@@ -361,25 +364,72 @@ typedef ssize_t (*send_t)(int, const void*, size_t, int);
 static sendto_t g_orig_sendto = nullptr;
 static send_t   g_orig_send   = nullptr;
 
+/*
+ * Reconstructed packet filter.
+ *
+ * The shipped binary hooks sendto() and drops - not rewrites - a specific class
+ * of UDP datagram. The predicate, recovered from 0x1500-0x1648, is:
+ *
+ *     dest is AF_INET and len >= 4
+ *     payload magic:  buf[0]==0xAA && buf[1]==0x55 && (buf[4]==2 || buf[4]==5)
+ *                  || (buf[2] & 0xFC) == 8
+ *     lobby traffic:  port - 8000  <= 1999   (i.e. 8000..9999)
+ *     game traffic:   port - 10000 <= 2000   (i.e. 10000..12000)
+ *
+ * On a match with the corresponding toggle on, it returns len (pretending the
+ * datagram left) without calling the real sendto, and latches the *Active flag.
+ * The caller keeps streaming; the beacon never reaches its destination.
+ *
+ * This is gated behind the two toggles, which default to off.
+ */
+static inline bool payload_magic(const unsigned char* b, size_t len) {
+    if (!b || len < 5) return false;
+    if (b[0] == 0xAA && b[1] == 0x55 && (b[4] == 2 || b[4] == 5)) return true;
+    if ((b[2] & 0xFC) == 0x08) return true;
+    return false;
+}
+
+static std::atomic<unsigned> g_dropped{0};
+
 static ssize_t hooked_sendto(int fd, const void* buf, size_t len, int flags,
                              const void* addr, socklen_t alen) {
-    if (g_state.lobbyBypass.load() && buf && len > 4) {
-        /* The game's integrity probe sends a small UDP packet; drop it. */
-        const unsigned char* b = (const unsigned char*)buf;
-        if (len < 0x800 && !(b[0] == 0xAA && b[1] == 0x55)) {
-            g_state.lobbyBypassActive.store(true);
+    if (addr && buf && len >= 4) {
+        const struct sockaddr* sa = (const struct sockaddr*)addr;
+        if (sa->sa_family == AF_INET) {
+            unsigned port = ntohs(((const struct sockaddr_in*)addr)->sin_port);
+            const unsigned char* b = (const unsigned char*)buf;
+
+            if (payload_magic(b, len)) {
+                if (g_state.lobbyBypass.load() && port >= 8000 && port <= 9999) {
+                    g_state.lobbyBypassActive.store(true);
+                    if (g_dropped.fetch_add(1) < 5) {
+                        LOGI("bypass: dropped lobby beacon (port %u, %zu bytes)", port, len);
+                    }
+                    return (ssize_t)len;      /* swallowed on purpose */
+                }
+                if (g_state.gameBypass.load() && port >= 10000 && port <= 12000) {
+                    g_state.gameBypassActive.store(true);
+                    if (g_dropped.fetch_add(1) < 5) {
+                        LOGI("bypass: dropped game beacon (port %u, %zu bytes)", port, len);
+                    }
+                    return (ssize_t)len;
+                }
+            }
         }
     }
     if (!g_orig_sendto) return -1;
     return g_orig_sendto(fd, buf, len, flags, addr, alen);
 }
 
+/* send() carries no destination, so only the game toggle can be applied. */
 static ssize_t hooked_send(int fd, const void* buf, size_t len, int flags) {
-    if (g_state.gameBypass.load() && buf && len > 4) {
-        const unsigned char* b = (const unsigned char*)buf;
-        if (len < 0x800 && !(b[0] == 0xAA && b[1] == 0x55)) {
-            g_state.gameBypassActive.store(true);
+    if (g_state.gameBypass.load() && buf && len >= 4 &&
+        payload_magic((const unsigned char*)buf, len)) {
+        g_state.gameBypassActive.store(true);
+        if (g_dropped.fetch_add(1) < 5) {
+            LOGI("bypass: dropped game beacon (send, %zu bytes)", len);
         }
+        return (ssize_t)len;
     }
     if (!g_orig_send) return -1;
     return g_orig_send(fd, buf, len, flags);
@@ -403,11 +453,37 @@ static void install_bypass_hooks() {
     LOGI("bypass: sendto=%s send=%s", sendto_res, send_res);
 }
 
+/*
+ * Polls /data/local/tmp/ant_aincrad.cfg twice a second so that toggling a
+ * switch in the launcher takes effect in the running game immediately, instead
+ * of only on the next launch.
+ */
+static void* config_poll_thread(void*) {
+    struct stat st;
+    time_t last_write = 0;
+    for (;;) {
+        usleep(500000);
+        if (stat(kConfigPath, &st) == 0 && st.st_mtime != last_write) {
+            last_write = st.st_mtime;
+            read_config();
+        }
+    }
+    return nullptr;
+}
+
 /* Exported exactly like the old binary: C++ linkage -> _Z16ant_aincrad_initv */
 void ant_aincrad_init() {
     LOGI("ANT-Aincrad initialising...");
 
     read_config();
+
+    /* Keep re-reading the toggle file: the UI lives in another process, so a
+     * switch flipped while the game is running has to be picked up here. */
+    pthread_t cfg_thread;
+    if (pthread_create(&cfg_thread, nullptr, config_poll_thread, nullptr) == 0)
+        pthread_detach(cfg_thread);
+    else
+        LOGE("config poller failed to start");
 
     if (shadowhook_init(SHADOWHOOK_MODE_UNIQUE, false) != 0) {
         LOGE("shadowhook_init failed err=%d", shadowhook_get_errno());
