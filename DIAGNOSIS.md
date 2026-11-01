@@ -380,3 +380,26 @@ The overlay is gated behind `INJECT BYPASS`; see `OVERLAY.md`. `SILENT_AIM.md`
 lists exactly what is verified (compilation, exports, hook maths) and what is not
 (camera follow, aim point height, `IsFiring` timing) so the user can test rather
 than trust.
+
+---
+
+## 12. "Crashing again" after the overlay
+
+Most likely cause, from the user's own earlier log:
+
+```
+W com.ffmodroot: Unexpected CPU variant for X86 using defaults: x86_64
+```
+
+BlueStacks is an **x86_64** process; the APK ships **arm64-v8a** only. Before the
+overlay nothing touched `libant_aincrad.so` at launch (`ModBridge` is a Kotlin
+`object`, loaded lazily on first toggle). The overlay called
+`ModBridge.isModLoaded()` every second from a Service, which forces the static
+initialiser → `UnsatisfiedLinkError` → `ExceptionInInitializerError`.
+
+Fixed by checking the ABI before any native reference
+(`nativeLibPresent()`), wrapping the load in `runCatching`, wrapping the
+ContentProvider, and replacing `android.widget.Switch` (theme-attribute hungry,
+inflated with the application theme from a Service context) with a plain Button.
+
+`add_floating_menu.ps1 -Remove` reverts everything if needed.

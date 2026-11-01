@@ -48,7 +48,8 @@ param(
     [string] $ProjectRoot = "C:\Users\anton\AndroidStudioProjects\FFMODROOT",
     [string] $Serial      = "127.0.0.1:5555",
     [string] $Package     = "com.ffmodroot",
-    [switch] $Grant
+    [switch] $Grant,
+    [switch] $Remove
 )
 
 $ErrorActionPreference = "Stop"
@@ -93,6 +94,68 @@ if (Test-Path $gradleApp) {
 }
 
 # ---------------------------------------------------------------------------
+# -Remove: put the project back the way it was, then stop.
+# ---------------------------------------------------------------------------
+if ($Remove) {
+    Step "R" "Removing the overlay"
+
+    foreach ($f in @("OverlayMenuService.kt", "OverlayAutoStart.kt", "Injector.kt")) {
+        $p = Join-Path $SrcDir $f
+        if (Test-Path $p) { Remove-Item $p -Force; Ok "deleted $f" } else { Ok "$f already absent" }
+    }
+
+    $mb = [System.IO.File]::ReadAllText($ModBridgeKt)
+    $before = $mb
+    foreach ($decl in @(
+            '(?m)^\s*external\s+fun\s+setSilentAimEnabled\s*\([^)]*\)\s*\r?\n',
+            '(?m)^\s*external\s+fun\s+isSilentAimActive\s*\([^)]*\)\s*:\s*Boolean\s*\r?\n'
+        )) {
+        $mb = $mb -replace $decl, ''
+    }
+    if ($mb -ne $before) {
+        [System.IO.File]::WriteAllText($ModBridgeKt, $mb, $Utf8NoBom)
+        Ok "removed the two silent-aim externals from ModBridge.kt"
+    } else {
+        Ok "ModBridge.kt unchanged"
+    }
+
+    [xml]$doc = Get-Content -Raw $Manifest
+    $NS = "http://schemas.android.com/apk/res/android"
+    $root = $doc.DocumentElement
+    $app = $root.SelectSingleNode("application")
+
+    foreach ($xpath in @(
+            "service[@*[local-name()='name']='.OverlayMenuService']",
+            "provider[@*[local-name()='name']='.OverlayAutoStart']"
+        )) {
+        $node = $app.SelectSingleNode($xpath)
+        if ($node) { [void]$app.RemoveChild($node); Ok "removed $xpath" }
+    }
+
+    foreach ($n in @($root.SelectNodes("uses-permission"))) {
+        $v = $n.GetAttribute("name", $NS)
+        if ($v -eq "android.permission.SYSTEM_ALERT_WINDOW" -or
+            $v -eq "android.permission.FOREGROUND_SERVICE_SPECIAL_USE") {
+            [void]$root.RemoveChild($n)
+            Ok "removed permission $v"
+        }
+    }
+
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Indent = $true
+    $settings.IndentChars = "    "
+    $settings.Encoding = $Utf8NoBom
+    $w = [System.Xml.XmlWriter]::Create($Manifest, $settings)
+    try { $doc.Save($w) } finally { $w.Close() }
+    Ok "manifest restored"
+
+    Write-Host ""
+    Ok "Overlay removed. Rebuild to get back to the last working app:"
+    Write-Host "      powershell -ExecutionPolicy Bypass -File .\fix_ffmodroot.ps1" -ForegroundColor White
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
 # 1. OverlayMenuService.kt
 # ---------------------------------------------------------------------------
 Step 1 "Writing OverlayMenuService.kt"
@@ -123,8 +186,8 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
-import android.widget.Switch
 import android.widget.TextView
+import java.io.File
 
 /**
  * Draggable in-game menu.
@@ -163,6 +226,22 @@ class OverlayMenuService : Service() {
             } catch (t: Throwable) {
                 Log.e(TAG, "stop failed: " + t)
             }
+        }
+    }
+
+    /**
+     * True only when the native library for THIS device's ABI is actually in
+     * the APK. BlueStacks reports x86_64; the project ships arm64-v8a only, so
+     * System.loadLibrary() would throw UnsatisfiedLinkError and take the whole
+     * app down. Never call ModBridge unless this returns true.
+     */
+    private fun nativeLibPresent(): Boolean {
+        return try {
+            val dir = applicationInfo?.nativeLibraryDir ?: return false
+            File(dir, "libant_aincrad.so").exists()
+        } catch (t: Throwable) {
+            Log.w(TAG, "nativeLibPresent check failed: " + t)
+            false
         }
     }
 
@@ -427,6 +506,20 @@ class OverlayMenuService : Service() {
      */
     private fun doInject() {
         val btn = injectBtn ?: return
+
+        // No point driving the native layer when its ABI is not in the APK -
+        // this is the case that used to crash the app on BlueStacks.
+        if (!nativeLibPresent()) {
+            prefs.edit().putBoolean(K_INJECTED, true).apply()
+            applyInjected(true, announce = true)
+            Log.w(TAG, "inject: native library absent for this ABI - unlocking UI only")
+            ui.post {
+                statusView?.setTextColor(Color.parseColor("#FF9F0A"))
+                statusView?.text = "hooks unavailable on this ABI\nrun Free Fire in an arm64 image, or ship x86_64 libs"
+            }
+            return
+        }
+
         btn.isEnabled = false
         btn.text = "INJECTING..."
 
@@ -448,9 +541,13 @@ class OverlayMenuService : Service() {
 
             if (!loaded) {
                 try {
-                    Injector.initHooks()
-                    base = try { Injector.getIl2cppBase() } catch (t: Throwable) { "0x0" }
-                    loaded = ModBridge.isModLoaded()
+                    if (Injector.loaded) {
+                        Injector.initHooks()
+                        base = try { Injector.getIl2cppBase() } catch (t: Throwable) { "0x0" }
+                        loaded = ModBridge.isModLoaded()
+                    } else {
+                        Log.w(TAG, "Injector object could not load the native library")
+                    }
                 } catch (t: Throwable) {
                     Log.e(TAG, "initHooks failed: " + t)
                 }
@@ -477,6 +574,15 @@ class OverlayMenuService : Service() {
         refreshStatus()
     }
 
+    /**
+     * A plain Button, not android.widget.Switch.
+     *
+     * Switch resolves switchStyle / colorControlActivated from the theme, and a
+     * Service context is inflated with the *application* theme - a Compose-only
+     * theme can leave those undefined, which throws Resources.NotFoundException
+     * while building the view and takes the process down before the menu is
+     * ever seen. Button + a text label has no such dependency.
+     */
     private fun addToggle(parent: LinearLayout, label: String, key: String, apply: (Boolean) -> Unit) {
         val row = LinearLayout(this)
         row.orientation = LinearLayout.HORIZONTAL
@@ -487,12 +593,24 @@ class OverlayMenuService : Service() {
         tv.setTextColor(Color.parseColor("#EDEDED"))
         tv.textSize = 13f
 
-        val sw = Switch(this)
-        sw.isChecked = prefs.getBoolean(key, false)
-        sw.setOnCheckedChangeListener { _, checked ->
-            prefs.edit().putBoolean(key, checked).apply()
+        val btn = Button(this)
+        btn.textSize = 11f
+        btn.minWidth = 0
+        btn.minimumWidth = 0
+
+        var on = prefs.getBoolean(key, false)
+        fun render() {
+            btn.text = if (on) "ON" else "OFF"
+            btn.setTextColor(Color.parseColor(if (on) "#34C759" else "#8A8A8E"))
+        }
+        render()
+
+        btn.setOnClickListener {
+            on = !on
+            render()
+            prefs.edit().putBoolean(key, on).apply()
             try {
-                apply(checked)
+                apply(on)
             } catch (t: Throwable) {
                 Log.e(TAG, "applying " + label + " failed: " + t)
             }
@@ -500,12 +618,22 @@ class OverlayMenuService : Service() {
         }
 
         row.addView(tv, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
-        row.addView(sw)
+        row.addView(btn)
         parent.addView(row)
     }
 
     private fun refreshStatus() {
         val t = statusView ?: return
+
+        // Guard before touching ModBridge: on a mismatched ABI the very first
+        // static reference throws and can kill the process.
+        if (!nativeLibPresent()) {
+            t.setTextColor(Color.parseColor("#FF9F0A"))
+            t.text = "no arm64 native library for this ABI\n(this emulator reports " +
+                android.os.Build.SUPPORTED_ABIS.firstOrNull() + ")\ntoggles saved, hooks unavailable"
+            return
+        }
+
         var loaded = false
         var silent = false
         try {
@@ -513,7 +641,7 @@ class OverlayMenuService : Service() {
             silent = ModBridge.isSilentAimActive()
         } catch (th: Throwable) {
             t.setTextColor(Color.parseColor("#FF9F0A"))
-            t.text = "native library not loaded"
+            t.text = "native library failed to load: " + th.javaClass.simpleName
             return
         }
         if (!loaded) {
@@ -559,22 +687,31 @@ import android.util.Log
 class OverlayAutoStart : ContentProvider() {
 
     override fun onCreate(): Boolean {
-        val ctx = context ?: return true
+        // A ContentProvider that throws here crashes the app before any Activity
+        // exists, which looks exactly like "the app started crashing again".
+        try {
+            val ctx = context ?: return true
 
-        val allowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
-            Settings.canDrawOverlays(ctx)
+            val allowed = Build.VERSION.SDK_INT < Build.VERSION_CODES.M ||
+                Settings.canDrawOverlays(ctx)
 
-        Log.i(OverlayMenuService.TAG, "OverlayAutoStart: overlayAllowed=" + allowed)
+            Log.i(OverlayMenuService.TAG, "OverlayAutoStart: overlayAllowed=" + allowed)
 
-        if (!allowed) {
-            Log.w(OverlayMenuService.TAG, "grant it with: adb shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow")
-            return true
+            if (!allowed) {
+                Log.w(OverlayMenuService.TAG, "grant it with: adb shell appops set com.ffmodroot SYSTEM_ALERT_WINDOW allow")
+                return true
+            }
+
+            Handler(Looper.getMainLooper()).postDelayed({
+                try {
+                    OverlayMenuService.start(ctx)
+                } catch (t: Throwable) {
+                    Log.e(OverlayMenuService.TAG, "service start failed: " + t)
+                }
+            }, 1500L)
+        } catch (t: Throwable) {
+            Log.e(OverlayMenuService.TAG, "OverlayAutoStart.onCreate failed: " + t)
         }
-
-        Handler(Looper.getMainLooper()).postDelayed({
-            OverlayMenuService.start(ctx)
-        }, 1500L)
-
         return true
     }
 
@@ -626,8 +763,19 @@ package com.ffmodroot
  * happens in the game process via deploy_ff.ps1.
  */
 object Injector {
+
+    @Volatile
+    var loaded: Boolean = false
+        private set
+
     init {
-        System.loadLibrary("ant_aincrad")
+        // runCatching matters: a bare System.loadLibrary() on a device whose ABI
+        // is not in the APK (BlueStacks is x86_64, this project is arm64-v8a)
+        // throws UnsatisfiedLinkError, which becomes ExceptionInInitializerError
+        // on every later reference and can take the process down.
+        loaded = runCatching { System.loadLibrary("ant_aincrad") }
+            .onFailure { android.util.Log.w("ANT-Aincrad-Overlay", "ant_aincrad not loadable: " + it) }
+            .isSuccess
     }
 
     external fun initHooks(): Boolean
