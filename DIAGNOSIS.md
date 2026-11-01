@@ -295,3 +295,42 @@ Both toggles default to **off**, and `send()` (no destination available) can
 only be filtered by the game toggle. Expect up to five
 `bypass: dropped ... beacon` lines per process, then silence, so logcat stays
 readable.
+
+---
+
+## 9. Verifying a build actually shipped the new module
+
+Total APK size is **not** a useful signal. Native libraries are deflated inside
+the archive, so a `.so` that grew by ~4 KB can leave the APK at exactly the same
+byte count. That happened here: the APK read `12,798,960` bytes both before and
+after the module went from 15,232 to 19,600 bytes.
+
+`fix_ffmodroot.ps1` now has a **step 5b** that opens the APK as a zip and prints
+the real *uncompressed* entry sizes:
+
+```
+== [5b] Verifying the native library inside the APK
+   lib/arm64-v8a/libant_aincrad.so      19,600 bytes (stored ...)
+   lib/arm64-v8a/libc++_shared.so    9,485,032 bytes (stored ...)
+   lib/arm64-v8a/libshadowhook.so      102,520 bytes (stored ...)
+   [OK]   libant_aincrad.so packaged at 19,600 bytes (old binary was 15,232)
+```
+
+It refuses to install when:
+
+- the entry is missing,
+- its size equals the old 15,232 bytes (stale binary),
+- it is under 8,000 bytes (truncated),
+- `libshadowhook.so` is absent (ant_aincrad links against it).
+
+Step 7 also distinguishes the three possible native states now:
+
+| log | meaning |
+|---|---|
+| `ANT-Aincrad loaded passively (launcher process)` | module loaded, correct for the UI |
+| `libil2cpp.so not found` | module ran, no game here — run `deploy_ff.ps1` |
+| `UnsatisfiedLinkError` / `dlopen failed` | the `.so` did not load |
+
+No native line at all is **normal** on a fresh launch: `ModBridge` is a Kotlin
+`object`, so `System.loadLibrary()` only runs the first time the UI touches it.
+Touch a toggle, then re-check logcat.
