@@ -260,3 +260,38 @@ powershell -ExecutionPolicy Bypass -File .\build_native.ps1
 
 The script refuses to copy a `.so` that is missing any of the 12 entry points, so
 a runtime `UnsatisfiedLinkError` cannot slip through again.
+
+---
+
+## 8. Live toggles and the real packet filter
+
+Two gaps that would still have looked like "nothing happens":
+
+**Toggles only applied on restart.** `read_config()` ran once, inside
+`ant_aincrad_init()`. Flip a switch in the launcher after the game is already
+running and the in-game copy kept the old values until the next launch. There is
+now a `config_poll_thread` that re-reads `/data/local/tmp/ant_aincrad.cfg` every
+500 ms (guarded by `stat()` mtime, so it only re-reads when the file changed).
+
+**The bypass hooks were pass-through stubs.** They hooked `sendto`/`send`,
+latched a flag, and forwarded everything. The shipped binary actually *drops*
+matching datagrams. The predicate, recovered from `0x1500`–`0x1648`:
+
+```
+dest is AF_INET and len >= 4
+payload magic:  buf[0]==0xAA && buf[1]==0x55 && (buf[4]==2 || buf[4]==5)
+             || (buf[2] & 0xFC) == 8
+lobby:  port - 8000  <= 1999      -> 8000..9999
+game:   port - 10000 <= 2000      -> 10000..12000
+```
+
+On a match with the corresponding toggle enabled the hook returns `len`
+(pretending the datagram left) without calling the real `sendto`, and latches
+`isLobbyBypassActive()` / `isGameBypassActive()`. That is what the original
+does at `0x1590` / `0x160c`: latch the flag, `mov x0, x2` (return the length),
+`ret` — never reaching the trampoline.
+
+Both toggles default to **off**, and `send()` (no destination available) can
+only be filtered by the game toggle. Expect up to five
+`bypass: dropped ... beacon` lines per process, then silence, so logcat stays
+readable.
