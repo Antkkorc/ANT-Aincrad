@@ -48,7 +48,17 @@ function Bad($m)  { Write-Host "   [FAIL] $m" -ForegroundColor Red }
 # 0. sanity
 # ---------------------------------------------------------------------------
 Step 0 "Checking project layout"
-if (-not (Test-Path $ProjectRoot)) { Bad "Project not found: $ProjectRoot"; exit 1 }
+if (-not (Test-Path $ProjectRoot)) {
+    # Fall back to the current directory if it looks like the Android project.
+    if (Test-Path (Join-Path (Get-Location) "gradlew.bat")) {
+        $ProjectRoot = (Get-Location).Path
+        Warn "using current directory as project root: $ProjectRoot"
+    } else {
+        Bad "Project not found: $ProjectRoot"
+        Bad "Pass it explicitly:  -ProjectRoot C:\path\to\FFMODROOT"
+        exit 1
+    }
+}
 
 $AppDir  = Join-Path $ProjectRoot "app"
 $JavaDir = Join-Path $AppDir "src\main\java\com\ffmodroot"
@@ -117,10 +127,9 @@ if (Test-Path $JniLibs) {
         Ok ("{0}  ({1:N0} bytes)" -f $_.Name, $_.Length)
     }
     $core = Join-Path $JniLibs "libant_aincrad.so"
-    if (Test-Path $core) {
-        $txt = (& cmd /c "findstr /C:`"Java_com_ffmodroot_ModBridge`" `"$core`"" 2>$null) -join "`n"
-        if ($txt -match "setAimEnabled") { Ok "libant_aincrad.so exports the ModBridge setXxxEnabled* API" }
-        else { Warn "could not confirm exports (findstr on binary); this is informational only" }
+    if (-not (Test-Path $core)) {
+        Bad "libant_aincrad.so missing from $JniLibs - the app would crash on System.loadLibrary"
+        $script:failed = $true
     }
 } else {
     Bad "jniLibs folder missing: $JniLibs"
