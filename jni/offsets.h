@@ -1,32 +1,62 @@
 #pragma once
 #include <stdint.h>
-namespace FF {
-    // Updated offsets based on the latest Free Fire Cheat Offsets and Bypass Codes (Scribd doc 823870034)
-    // GameFacade offsets
-    constexpr uintptr_t CurrentMatch    = 0x15E6540; // GameFacade CurrentMatch
-    constexpr uintptr_t GetLocalPlayer  = 0x210D7C4; // UavMapObject GetLocalPlayer (or GameFacade CurrentLocalPlayer 0x15E6B40)
-    constexpr uintptr_t GetPlayerByIdx  = 0x15E7440; // GameFacade GetLocalPlayerOrObServer (proxy for GetPlayerByIdx)
-    
-    // Aim Rotation (Player Class SetAimRotation)
-    constexpr uintptr_t SetAimRotation_v1 = 0x11AD820; // SetAimRotation (Aimbot Use)
-    constexpr uintptr_t SetAimRotation_v2 = 0x11AD820; // Unified for v1/v2 in latest build
-    
-    // Player Attributes
-    constexpr uintptr_t get_CurHP       = 0x1207CBC; // GetHp
-    constexpr uintptr_t IsVisible       = 0x11B1254; // IsVisible
-    constexpr uintptr_t IsFiring        = 0x11A1844; // IsFiring
-    constexpr uintptr_t get_IsSighting  = 0x11A18E0; // get_IsSighting
-    constexpr uintptr_t IsLocalPlayer   = 0x15E6B40; // CurrentLocalPlayer
-    constexpr uintptr_t IsLocalTeammate = 0x11BFEA4; // IsLocalTeammate
-    constexpr uintptr_t get_IsDieing    = 0x11A11E8; // get_IsDieing
-    constexpr uintptr_t IsCrouching     = 0x11C315C; // IsCrouching
-    constexpr uintptr_t get_IsSkyDiving = 0x11A13CC; // IsMoving (proxy for SkyDiving state)
-    constexpr uintptr_t get_IsSkyDashing= 0x11B0D5C; // IsSkyDashing
-    constexpr uintptr_t get_IsParachuting= 0x11A13CC; // IsMoving (proxy)
-    
-    // Transforms
-    constexpr uintptr_t FIELD_HEAD_TF   = 0x1220990; // GetHeadTF
-    constexpr uintptr_t FIELD_HIP_TF    = 0x1220B74; // GetHipTF
-    constexpr uintptr_t Transform_get_position = 0x61B5E1C; // get_position_Injected
-    constexpr uintptr_t Transform_get_forward  = 0x61B697C; // Get Forward
-}
+
+/*
+ * ANT-Aincrad offset table
+ * ========================
+ *
+ * These values were RECOVERED BY DISASSEMBLING the actual working binary
+ * `libs/arm64-v8a/libant_aincrad.so` (15 232 bytes, arm64-v8a).
+ *
+ * They are the values the shipped .so really uses. They are NOT the values that
+ * were previously in this header (those came from an external offset list and
+ * do not match this build of Free Fire at all).
+ *
+ * If Free Fire updates, every value below has to be re-derived. The runtime
+ * validates the SetAimRotation prologue before hooking, so a stale table makes
+ * the aim hook refuse to install instead of crashing the game.
+ *
+ * All values are RVAs from the load base of libil2cpp.so.
+ */
+namespace FFV {
+
+/* --- match / player access --------------------------------------------- */
+constexpr uintptr_t CurrentMatch      = 0x25C277C;  /* returns Match*            */
+constexpr uintptr_t GetPlayerByIdx    = 0x12B1600;  /* (Match*, int) -> Player*  */
+
+/* --- player state getters (Player*) ------------------------------------ */
+constexpr uintptr_t get_CurHP         = 0x0AA1A74;  /* int  hp                   */
+constexpr uintptr_t IsLocalPlayer     = 0x0AACEC8;  /* bool                      */
+constexpr uintptr_t IsFiring          = 0x0AC77A8;  /* bool                      */
+constexpr uintptr_t get_IsSighting    = 0x0AF8410;  /* bool                      */
+constexpr uintptr_t IsLocalTeammate   = 0x0AAF4E8;  /* bool                      */
+constexpr uintptr_t get_IsDieing      = 0x0AB4ABC;  /* bool                      */
+constexpr uintptr_t IsVisible         = 0x0AAEB6C;  /* bool                      */
+constexpr uintptr_t IsCrouching       = 0x0AAE66C;  /* bool                      */
+constexpr uintptr_t get_IsSkyDiving   = 0x0AAEA48;  /* bool                      */
+constexpr uintptr_t get_IsSkyDashing  = 0x0AAE264;  /* bool                      */
+
+/* --- transforms -------------------------------------------------------- */
+constexpr uintptr_t Transform_get_position = 0x2908DF8; /* Transform* -> Vector3 */
+
+/* --- the function we hook ---------------------------------------------- */
+constexpr uintptr_t SetAimRotation    = 0x11AD820;
+
+/* Prologue probe: the first two bytes of a normal AArch64 prologue. */
+constexpr uint8_t PROLOGUE_0 = 0xFD;
+constexpr uint8_t PROLOGUE_1 = 0x7B;   /* (b[1] & 0x7F) == 0x6F            */
+
+/* --- struct field ------------------------------------------------------- */
+constexpr size_t PLAYER_TRANSFORM_FIELD = 0x18C;
+
+/* --- tuning constants taken from the binary ---------------------------- */
+constexpr int   MAX_PLAYER_SCAN       = 0x3B;      /* 59 players             */
+constexpr float MAX_TARGET_DISTANCE   = 1.0e9f;
+constexpr float AIM_SMOOTHING         = 3.0f;
+constexpr float QUAT_EPSILON          = 0.99999f;  /* 0x3F7FDF3B             */
+
+/* --- module names ------------------------------------------------------- */
+constexpr const char* GAME_MODULE = "libil2cpp.so";
+constexpr const char* LIBC_MODULE = "libc.so";
+
+} // namespace FFV
