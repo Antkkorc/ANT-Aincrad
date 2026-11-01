@@ -40,7 +40,9 @@
 
 [CmdletBinding()]
 param(
-    [string] $RepoRoot  = $PSScriptRoot,
+    # Empty on purpose: $PSScriptRoot is unreliable in a param default under
+    # `powershell -File` and was causing "Path ... empty string" failures.
+    [string] $RepoRoot  = "",
     [string] $Serial    = "127.0.0.1:5555",
     [string] $Package   = "com.dts.freefireth",
     [string] $DeviceDir = "/data/local/tmp",
@@ -84,6 +86,20 @@ if ($Undeploy) {
 
 # ---------------------------------------------------------------------------
 Step 1 "Pushing the native libraries"
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    foreach ($c in @($PSScriptRoot, (Split-Path -Parent $MyInvocation.MyCommand.Path), (Get-Location).Path)) {
+        if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path (Join-Path $c "libs"))) {
+            $RepoRoot = (Resolve-Path $c).Path
+            break
+        }
+    }
+}
+if ([string]::IsNullOrWhiteSpace($RepoRoot)) {
+    Bad "Could not find the repo (folder containing 'libs'). Pass -RepoRoot C:\path\to\ANT-Aincrad-repo"
+    exit 1
+}
+Ok "repo: $RepoRoot"
+
 $libs = @("libant_aincrad.so", "libshadowhook.so", "libc++_shared.so")
 $srcDirs = @(
     (Join-Path $RepoRoot "libs\arm64-v8a"),
